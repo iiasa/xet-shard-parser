@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "xet_shard_parser"
+version = "0.1.0"
+description = "Python bindings to parse Xet shards and extract reconstruction info"
+authors = [{ name = "Rupesh S", email = "wrufesh@gmail.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+homepage = "https://github.com/yourname/xet_shard_parser"
+repository = "https://github.com/yourname/xet_shard_parser"
