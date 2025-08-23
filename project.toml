@@ -3,21 +3,39 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "xet_shard_parser"
-version = "0.1.0"
+name = "xet-shard-parser"  # 🔑 Use hyphen here, since PyPI normalizes names this way
+version = "0.1.1"
 description = "Python bindings to parse Xet shards and extract reconstruction info"
 authors = [{ name = "Rupesh S", email = "wrufesh@gmail.com" }]
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.8"
+
+# Good to have trove classifiers so PyPI search works better
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
     "Programming Language :: Python",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: Implementation :: CPython",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
 ]
 
 [project.urls]
-homepage = "https://github.com/yourname/xet_shard_parser"
-repository = "https://github.com/yourname/xet_shard_parser"
+Homepage = "https://github.com/yourname/xet_shard_parser"
+Repository = "https://github.com/yourname/xet_shard_parser"
+Issues = "https://github.com/yourname/xet_shard_parser/issues"
+
+[tool.maturin]
+# maturin-specific config (optional, but recommended for Rust bindings)
+features = ["pyo3/extension-module"]
