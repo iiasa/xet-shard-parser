@@ -1,92 +1,94 @@
 use std::io::Cursor;
+use std::collections::HashSet;
 
-use mdb_shard::streaming_shard::MDBMinimalShard;
+use mdb_shard::metadata_shard::streaming_shard::MDBMinimalShard;
+use mdb_shard::merklehash::MerkleHash;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 #[pyfunction]
 #[allow(unsafe_op_in_unsafe_fn)]
-pub fn extract_file_reconstruction_info(
+pub fn extract_shard_metadata(
     py: Python<'_>,
     shard_bytes: &[u8],
-) -> PyResult<Vec<(String, Py<PyDict>)>> {
-    // Parse shard (files only, no CAS)
+) -> PyResult<Py<PyDict>> {
+    // Parse shard (files AND XORB info)
     let mut cursor = Cursor::new(shard_bytes);
-    let shard = MDBMinimalShard::from_reader(&mut cursor, true, false)
+    let shard = MDBMinimalShard::from_reader(&mut cursor, true, true)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {e:?}")))?;
 
-    let mut results = Vec::new();
+    let root_dict = PyDict::new(py);
 
+    // 1. Files Index
+    let file_list = PyList::empty(py);
     for i in 0..shard.num_files() {
         if let Some(fiv) = shard.file(i) {
-            let file_hash = fiv.file_hash().to_string();
-
-            // Dict for the file
-            let dict = PyDict::new(py);
-            dict.set_item("file_hash", &file_hash)?;
-            dict.set_item("num_entries", fiv.num_entries())?;
-
-            // Segments
-            let segs = PyList::empty(py);
+            let file_dict = PyDict::new(py);
+            let h: MerkleHash = fiv.file_hash();
+            file_dict.set_item("file_hash", PyBytes::new(py, h.as_bytes()))?;
+            
+            let segments = PyList::empty(py);
             for j in 0..fiv.num_entries() {
                 let seg = fiv.entry(j);
-
                 let seg_dict = PyDict::new(py);
-                seg_dict.set_item("hash", seg.cas_hash.to_string())?;
-                seg_dict.set_item("unpacked_length", seg.unpacked_segment_bytes)?;
-                seg_dict.set_item("start", seg.chunk_index_start)?;
-                seg_dict.set_item("end", seg.chunk_index_end)?;
-
-                segs.append(seg_dict)?;
+                let xh: MerkleHash = seg.xorb_hash;
+                seg_dict.set_item("h", PyBytes::new(py, xh.as_bytes()))?;
+                seg_dict.set_item("s", seg.chunk_index_start)?;
+                seg_dict.set_item("e", seg.chunk_index_end)?;
+                seg_dict.set_item("l", seg.unpacked_segment_bytes)?;
+                segments.append(seg_dict)?;
             }
-            dict.set_item("segments", segs)?;
-
-            results.push((file_hash, dict.into_py(py)));
+            file_dict.set_item("segments", segments)?;
+            file_list.append(file_dict)?;
         }
     }
+    root_dict.set_item("files", file_list)?;
 
-    Ok(results)
+    // 2. XORB Index & 3. Global Dedup Chunks
+    let xorb_list = PyList::empty(py);
+    let mut eligible_chunks = HashSet::new();
+
+    for i in 0..shard.num_xorb() {
+        if let Some(xiv) = shard.xorb(i) {
+            let xorb_dict = PyDict::new(py);
+            let xh: MerkleHash = xiv.xorb_hash();
+            xorb_dict.set_item("xorb_hash", PyBytes::new(py, xh.as_bytes()))?;
+            
+            let layout = PyList::empty(py);
+            for j in 0..xiv.num_entries() {
+                let chunk = xiv.chunk(j);
+                
+                // Add to XORB layout: [offset, length]
+                let entry = PyList::empty(py);
+                entry.append(chunk.chunk_byte_range_start)?;
+                entry.append(chunk.unpacked_segment_bytes)?;
+                layout.append(entry)?;
+
+                // Collect global dedup eligible chunks
+                if chunk.is_global_dedup_eligible() {
+                    let ch: MerkleHash = chunk.chunk_hash;
+                    eligible_chunks.insert(ch);
+                }
+            }
+            xorb_dict.set_item("chunk_layout", layout)?;
+            xorb_list.append(xorb_dict)?;
+        }
+    }
+    root_dict.set_item("xorbs", xorb_list)?;
+
+    // 4. Flattened Eligible Chunks
+    let chunk_list = PyList::empty(py);
+    for hash in eligible_chunks {
+        let ch: MerkleHash = hash;
+        chunk_list.append(PyBytes::new(py, ch.as_bytes()))?;
+    }
+    root_dict.set_item("eligible_chunks", chunk_list)?;
+
+    Ok(root_dict.into_py(py))
 }
 
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(extract_file_reconstruction_info, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_shard_metadata, m)?)?;
     Ok(())
 }
-
-
-// In Python
-// from xet_shard_parser import extract_file_reconstruction_info
-
-// files = extract_file_reconstruction_info(open("shard.dat", "rb").read())
-// print(files)
-
-// [
-//   (
-//     "abcd1234...", 
-//     {
-//       "file_hash": "abcd1234...",
-//       "num_entries": 2,
-//       "segments": [
-//          {"hash": "xxxx", "unpacked_length": 1024, "start": 0, "end": 1024},
-//          {"hash": "yyyy", "unpacked_length": 2048, "start": 1024, "end": 3072}
-//       ]
-//     }
-//   ),
-//   ...
-// ]
-
-// reconstruction response should be :
-
-// {
-//     file_hash: file_hash.
-//     terms: [
-//         {
-//             hash: chunk_hash,
-//             unpacked_length: unpacked_segment_bytes,
-//             start: range_start,
-//             end: range_end
-//         },
-//         ...
-//     ]
-// }

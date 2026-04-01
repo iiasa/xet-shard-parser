@@ -38,4 +38,5 @@ Issues = "https://github.com/yourname/xet_shard_parser/issues"
 
 [tool.maturin]
 # maturin-specific config (optional, but recommended for Rust bindings)
-features = ["pyo3/extension-module"]
+module-name = "xet_shard_parser"
+features = ["pyo3/extension-module", "pyo3/abi3-py38"]
