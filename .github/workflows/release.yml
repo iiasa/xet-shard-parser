@@ -21,9 +21,11 @@ jobs:
           python-version: '3.11'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_SKIP_PYPY: 1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --skip-pypy
+          args: --release --out dist -i python3.11
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
@@ -44,9 +46,11 @@ jobs:
           python-version: '3.11'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_SKIP_PYPY: 1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --skip-pypy
+          args: --release --out dist --find-interpreter
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -66,9 +70,11 @@ jobs:
           python-version: '3.11'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_SKIP_PYPY: 1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter --skip-pypy
+          args: --release --out dist --find-interpreter
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
