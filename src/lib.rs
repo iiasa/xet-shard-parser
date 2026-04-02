@@ -25,14 +25,14 @@ pub fn extract_shard_metadata(
         if let Some(fiv) = shard.file(i) {
             let file_dict = PyDict::new(py);
             let h: MerkleHash = fiv.file_hash();
-            file_dict.set_item("file_hash", PyBytes::new(py, h.as_bytes()))?;
+            file_dict.set_item("file_hash", h.hex())?;
             
             let segments = PyList::empty(py);
             for j in 0..fiv.num_entries() {
                 let seg = fiv.entry(j);
                 let seg_dict = PyDict::new(py);
                 let xh: MerkleHash = seg.xorb_hash;
-                seg_dict.set_item("h", PyBytes::new(py, xh.as_bytes()))?;
+                seg_dict.set_item("h", xh.hex())?;
                 seg_dict.set_item("s", seg.chunk_index_start)?;
                 seg_dict.set_item("e", seg.chunk_index_end)?;
                 seg_dict.set_item("l", seg.unpacked_segment_bytes)?;
@@ -52,7 +52,7 @@ pub fn extract_shard_metadata(
         if let Some(xiv) = shard.xorb(i) {
             let xorb_dict = PyDict::new(py);
             let xh: MerkleHash = xiv.xorb_hash();
-            xorb_dict.set_item("xorb_hash", PyBytes::new(py, xh.as_bytes()))?;
+            xorb_dict.set_item("xorb_hash", xh.hex())?;
             
             let layout = PyList::empty(py);
             for j in 0..xiv.num_entries() {
@@ -80,7 +80,7 @@ pub fn extract_shard_metadata(
     let chunk_list = PyList::empty(py);
     for hash in eligible_chunks {
         let ch: MerkleHash = hash;
-        chunk_list.append(PyBytes::new(py, ch.as_bytes()))?;
+        chunk_list.append(ch.hex())?;
     }
     root_dict.set_item("eligible_chunks", chunk_list)?;
 
