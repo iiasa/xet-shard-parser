@@ -62,8 +62,10 @@ pub fn extract_shard_metadata(
             for j in 0..xiv.num_entries() {
                 let chunk = xiv.chunk(j);
                 
-                // Add to XORB layout: [offset, length]
+                // Add to XORB layout: [hash, offset, length]
                 let entry = PyList::empty(py);
+                let ch: MerkleHash = chunk.chunk_hash;
+                entry.append(ch.hex())?;
                 entry.append(chunk.chunk_byte_range_start)?;
                 entry.append(chunk.unpacked_segment_bytes)?;
                 layout.append(entry)?;
