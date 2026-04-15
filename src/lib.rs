@@ -156,10 +156,46 @@ pub fn merge_shards(
 
     Ok(dest_shards.into_py(py))
 }
+#[pyfunction]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub fn create_shard(
+    py: Python<'_>,
+    xorb_hash_hex: &str,
+    total_size: u32,
+    chunk_layout: Vec<(&str, u32, u32)>, 
+) -> PyResult<Py<PyBytes>> {
+    use mdb_shard::merklehash::MerkleHash;
+    use mdb_shard::metadata_shard::xorb_structs::{MDBXorbInfo, XorbChunkSequenceHeader, XorbChunkSequenceEntry};
+    use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
+
+    let xorb_hash = MerkleHash::from_hex(xorb_hash_hex)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Bad XORB Hash: {:?}", e)))?;
+
+    let mut chunks = Vec::with_capacity(chunk_layout.len());
+    for (c_hash_hex, offset, length) in chunk_layout {
+        let chunk_hash = MerkleHash::from_hex(c_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Bad Chunk Hash: {:?}", e)))?;
+        let entry = XorbChunkSequenceEntry::new(chunk_hash, length, offset);
+        chunks.push(entry);
+    }
+
+    let header = XorbChunkSequenceHeader::new(xorb_hash, chunks.len() as u32, total_size);
+    let xorb_info = std::sync::Arc::new(MDBXorbInfo { metadata: header, chunks });
+
+    let mut shard = MDBInMemoryShard::default();
+    shard.add_xorb_block(xorb_info)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to add XORB: {:?}", e)))?;
+    
+    let shard_bytes = shard.to_bytes()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to serialize shard: {:?}", e)))?;
+
+    Ok(PyBytes::new(py, &shard_bytes).into_py(py))
+}
 
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_shard_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
+    m.add_function(wrap_pyfunction!(create_shard, m)?)?;
     Ok(())
 }
