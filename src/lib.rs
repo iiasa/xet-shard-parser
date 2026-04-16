@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use mdb_shard::metadata_shard::streaming_shard::MDBMinimalShard;
 use mdb_shard::metadata_shard::set_operations::shard_set_union;
 use mdb_shard::metadata_shard::{MDBShardInfo, MDBShardFileHeader, MDBShardFileFooter};
-use mdb_shard::merklehash::MerkleHash;
+use mdb_shard::merklehash::{MerkleHash, file_hash};
+use xet_data::deduplication::Chunker;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::mem::size_of;
@@ -192,10 +193,25 @@ pub fn create_shard(
     Ok(PyBytes::new(py, &shard_bytes).into_py(py))
 }
 
+#[pyfunction]
+pub fn calculate_file_hash(data: &[u8]) -> PyResult<String> {
+    let mut chunker = Chunker::default();
+    let chunks = chunker.next_block(data, true);
+    
+    let mut chunk_hashes = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        chunk_hashes.push((chunk.hash, chunk.data.len() as u64));
+    }
+    
+    let hash = file_hash(&chunk_hashes);
+    Ok(hash.hex())
+}
+
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_shard_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
     m.add_function(wrap_pyfunction!(create_shard, m)?)?;
+    m.add_function(wrap_pyfunction!(calculate_file_hash, m)?)?;
     Ok(())
 }

@@ -8,7 +8,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.20", features = ["extension-module", "abi3-py38"] }
-mdb_shard = { package = "xet-core-structures", git = "https://github.com/huggingface/xet-core.git", tag = "v1.4.2" }
+mdb_shard = { package = "xet-core-structures", path = "../xet-core/xet_core_structures" }
+xet_data = { package = "xet-data", path = "../xet-core/xet_data" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
