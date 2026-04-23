@@ -1,15 +1,221 @@
-use std::io::{Cursor, Read, Seek};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use mdb_shard::metadata_shard::streaming_shard::MDBMinimalShard;
 use mdb_shard::metadata_shard::set_operations::shard_set_union;
 use mdb_shard::metadata_shard::{MDBShardInfo, MDBShardFileHeader, MDBShardFileFooter};
-use mdb_shard::merklehash::{MerkleHash, file_hash};
+use mdb_shard::metadata_shard::ShardFileManager;
+use mdb_shard::metadata_shard::file_structs::MDBFileInfo;
+use mdb_shard::metadata_shard::shard_file_reconstructor::FileReconstructor;
+use mdb_shard::merklehash::{MerkleHash, file_hash, compute_data_hash};
 use xet_data::deduplication::Chunker;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyType};
 use std::mem::size_of;
 use std::mem::swap;
+
+const GLOBAL_DEDUP_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb::TableDefinition::new("global_dedup");
+
+#[pyclass]
+pub struct ShardIndex {
+    sfm: Arc<ShardFileManager>,
+    rt: tokio::runtime::Runtime,
+    db: Arc<redb::Database>,
+}
+
+#[pymethods]
+impl ShardIndex {
+    #[new]
+    pub fn new(cache_dir: String, db_path: String, max_cache_size: Option<u64>) -> PyResult<Self> {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create tokio runtime: {e}")))?;
+        
+        let sfm = rt.block_on(async {
+            ShardFileManager::new_in_cache_directory(cache_dir).await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to init ShardFileManager: {e:?}")))?;
+
+        let db = redb::Database::create(db_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open redb: {e}")))?;
+
+        let index = ShardIndex {
+            sfm,
+            rt,
+            db: Arc::new(db),
+        };
+
+        // Trigger an initial refresh with the size limit
+        index.refresh(max_cache_size)?;
+
+        Ok(index)
+    }
+
+    pub fn prune_shard(&self, shard_hash_hex: &str) -> PyResult<()> {
+        let h = MerkleHash::from_hex(shard_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+        let h_bytes: [u8; 32] = h.into();
+
+        let write_txn = self.db.begin_write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+        {
+            let mut table = write_txn.open_table(GLOBAL_DEDUP_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+            
+            let mut to_delete = Vec::new();
+            for entry in table.iter().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))? {
+                let (k, v) = entry.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                if v.value() == &h_bytes {
+                    to_delete.push(*k.value());
+                }
+            }
+
+            for k in to_delete {
+                table.remove(&k)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Remove failed: {e}")))?;
+            }
+        }
+        write_txn.commit()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+
+        Ok(())
+    }
+
+    pub fn register_shard(&self, shard_bytes: &[u8]) -> PyResult<()> {
+        // 1. Register with ShardFileManager (persists .sib to disk and indexes in memory)
+        self.rt.block_on(async {
+            self.sfm.import_shard_from_bytes(shard_bytes).await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to import shard: {e:?}")))?;
+
+        // 2. Index global deduplication chunks in redb
+        let mut cursor = Cursor::new(shard_bytes);
+        let shard = MDBMinimalShard::from_reader(&mut cursor, false, true)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {e:?}")))?;
+
+        let shard_hash = compute_data_hash(shard_bytes);
+        let shard_hash_bytes: [u8; 32] = shard_hash.into();
+
+        let write_txn = self.db.begin_write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+        {
+            let mut table = write_txn.open_table(GLOBAL_DEDUP_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+            
+            for i in 0..shard.num_xorb() {
+                if let Some(xiv) = shard.xorb(i) {
+                    for j in 0..xiv.num_entries() {
+                        let chunk = xiv.chunk(j);
+                        if chunk.is_global_dedup_eligible() {
+                            let chunk_hash_bytes: [u8; 32] = chunk.chunk_hash.into();
+                            table.insert(&chunk_hash_bytes, &shard_hash_bytes)
+                                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert failed: {e}")))?;
+                        }
+                    }
+                }
+            }
+        }
+        write_txn.commit()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+
+        Ok(())
+    }
+
+    pub fn get_reconstruction(&self, py: Python<'_>, file_hash_hex: &str) -> PyResult<Option<Py<PyDict>>> {
+        let h = MerkleHash::from_hex(file_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+
+        let res = self.rt.block_on(async {
+            self.sfm.get_file_reconstruction_info(&h).await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed: {e:?}")))?;
+
+        if let Some((file_info, _shard_hash)) = res {
+            let dict = PyDict::new(py);
+            let segments = PyList::empty(py);
+            for seg in file_info.segments {
+                let seg_dict = PyDict::new(py);
+                seg_dict.set_item("h", seg.xorb_hash.hex())?;
+                seg_dict.set_item("s", seg.chunk_index_start)?;
+                seg_dict.set_item("e", seg.chunk_index_end)?;
+                seg_dict.set_item("l", seg.unpacked_segment_bytes)?;
+                segments.append(seg_dict)?;
+            }
+            dict.set_item("segments", segments)?;
+            return Ok(Some(dict.into()));
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_chunk_shard(&self, chunk_hash_hex: &str) -> PyResult<Option<String>> {
+        let h = MerkleHash::from_hex(chunk_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+        let h_bytes: [u8; 32] = h.into();
+
+        let read_txn = self.db.begin_read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+        let table = read_txn.open_table(GLOBAL_DEDUP_TABLE)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+        
+        let res = table.get(&h_bytes)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+
+        if let Some(shard_hash_bytes) = res {
+            let shard_hash = MerkleHash::from(*shard_hash_bytes.value());
+            return Ok(Some(shard_hash.hex()));
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_xorb_layout(&self, py: Python<'_>, xorb_hash_hex: &str) -> PyResult<Option<Py<PyList>>> {
+        let h = MerkleHash::from_hex(xorb_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+
+        let shards = self.rt.block_on(async {
+            self.sfm.registered_shard_list().await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
+
+        for shard_file in shards {
+            let mut reader = shard_file.get_reader()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open shard reader: {e:?}")))?;
+            
+            let mut dest_indices = [0u32; 8];
+            if let Ok(num_indices) = shard_file.shard.get_xorb_info_index_by_hash(&mut reader, &h, &mut dest_indices) {
+                if num_indices > 0 {
+                    reader.rewind().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                    let m_shard = MDBMinimalShard::from_reader(&mut reader, false, true)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {e:?}")))?;
+                    
+                    for i in 0..m_shard.num_xorb() {
+                        if let Some(xiv) = m_shard.xorb(i) {
+                            if xiv.xorb_hash() == h {
+                                let list = PyList::empty(py);
+                                for j in 0..xiv.num_entries() {
+                                    let chunk = xiv.chunk(j);
+                                    let entry = PyList::empty(py);
+                                    entry.append(chunk.chunk_hash.hex())?;
+                                    entry.append(chunk.chunk_byte_range_start)?;
+                                    entry.append(chunk.unpacked_segment_bytes)?;
+                                    list.append(entry)?;
+                                }
+                                return Ok(Some(list.into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn refresh(&self, max_cache_size: Option<u64>) -> PyResult<()> {
+        let prune_size = max_cache_size.unwrap_or(0);
+        self.rt.block_on(async {
+            self.sfm.refresh_shard_dir(false, prune_size).await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Refresh failed: {e:?}")))?;
+        Ok(())
+    }
+}
 
 #[pyfunction]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -194,6 +400,7 @@ pub fn create_shard(
 }
 
 #[pyfunction]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub fn calculate_file_hash(data: &[u8]) -> PyResult<String> {
     let mut chunker = Chunker::default();
     let chunks = chunker.next_block(data, true);
@@ -209,6 +416,7 @@ pub fn calculate_file_hash(data: &[u8]) -> PyResult<String> {
 
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<ShardIndex>()?;
     m.add_function(wrap_pyfunction!(extract_shard_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
     m.add_function(wrap_pyfunction!(create_shard, m)?)?;
