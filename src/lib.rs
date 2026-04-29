@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Seek};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -6,16 +6,18 @@ use mdb_shard::metadata_shard::streaming_shard::MDBMinimalShard;
 use mdb_shard::metadata_shard::set_operations::shard_set_union;
 use mdb_shard::metadata_shard::{MDBShardInfo, MDBShardFileHeader, MDBShardFileFooter};
 use mdb_shard::metadata_shard::ShardFileManager;
-use mdb_shard::metadata_shard::file_structs::MDBFileInfo;
+
 use mdb_shard::metadata_shard::shard_file_reconstructor::FileReconstructor;
 use mdb_shard::merklehash::{MerkleHash, file_hash, compute_data_hash};
 use xet_data::deduplication::Chunker;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyType};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::mem::size_of;
 use std::mem::swap;
 
+use redb::ReadableTable;
 const GLOBAL_DEDUP_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb::TableDefinition::new("global_dedup");
+
 
 #[pyclass]
 pub struct ShardIndex {
@@ -315,7 +317,7 @@ pub fn merge_shards(
     let mut next_data = Vec::<u8>::with_capacity(target_max_size as usize);
     let mut out_data = Vec::<u8>::with_capacity(target_max_size as usize);
 
-    let mut dest_shards = PyList::empty(py);
+    let dest_shards = PyList::empty(py);
     let mut cur_si = MDBShardInfo::default();
 
     for data in shard_list {

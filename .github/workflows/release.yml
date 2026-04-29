@@ -59,10 +59,10 @@ jobs:
           path: dist
 
   macos:
-    runs-on: macos-latest
+    runs-on: macos-14
     strategy:
       matrix:
-        target: [universal2-apple-darwin]
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -74,13 +74,14 @@ jobs:
           MATURIN_PYPI_SKIP_PYPY: 1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
-          sccache: 'true'
+          args: --release --out dist -i python3.11
+          sccache: 'false'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist
+
 
   sdist:
     runs-on: ubuntu-latest
