@@ -60,8 +60,11 @@ impl ShardIndex {
         let write_txn = self.db.begin_write()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
         {
-            let mut table = write_txn.open_table(GLOBAL_DEDUP_TABLE)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+            let mut table = match write_txn.open_table(GLOBAL_DEDUP_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
+            };
             
             let mut to_delete = Vec::new();
             for entry in table.iter().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))? {
@@ -154,8 +157,11 @@ impl ShardIndex {
 
         let read_txn = self.db.begin_read()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
-        let table = read_txn.open_table(GLOBAL_DEDUP_TABLE)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+        let table = match read_txn.open_table(GLOBAL_DEDUP_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
+        };
         
         let res = table.get(&h_bytes)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
