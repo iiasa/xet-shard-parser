@@ -4254,7 +4254,7 @@ dependencies = [
 
 [[package]]
 name = "xet_shard_parser"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "async-trait",

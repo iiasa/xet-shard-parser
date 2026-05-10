@@ -85,7 +85,7 @@ impl ShardIndex {
         Ok(())
     }
 
-    pub fn register_shard(&self, shard_bytes: &[u8]) -> PyResult<()> {
+    pub fn register_shard(&self, shard_bytes: &[u8], shard_hash_hex: Option<String>) -> PyResult<()> {
         // 1. Register with ShardFileManager (persists .sib to disk and indexes in memory)
         self.rt.block_on(async {
             self.sfm.import_shard_from_bytes(shard_bytes).await
@@ -96,7 +96,12 @@ impl ShardIndex {
         let shard = MDBMinimalShard::from_reader(&mut cursor, true, true)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {e:?}")))?;
 
-        let shard_hash = compute_data_hash(shard_bytes);
+        let shard_hash = if let Some(h_hex) = shard_hash_hex {
+            MerkleHash::from_hex(&h_hex)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid shard hash hex: {e:?}")))?
+        } else {
+            compute_data_hash(shard_bytes)
+        };
         let shard_hash_bytes: [u8; 32] = shard_hash.into();
 
         let write_txn = self.db.begin_write()
