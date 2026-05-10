@@ -93,7 +93,7 @@ impl ShardIndex {
 
         // 2. Index global deduplication chunks in redb
         let mut cursor = Cursor::new(shard_bytes);
-        let shard = MDBMinimalShard::from_reader(&mut cursor, false, true)
+        let shard = MDBMinimalShard::from_reader(&mut cursor, true, true)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {e:?}")))?;
 
         let shard_hash = compute_data_hash(shard_bytes);
@@ -105,17 +105,10 @@ impl ShardIndex {
             let mut table = write_txn.open_table(GLOBAL_DEDUP_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
             
-            for i in 0..shard.num_xorb() {
-                if let Some(xiv) = shard.xorb(i) {
-                    for j in 0..xiv.num_entries() {
-                        let chunk = xiv.chunk(j);
-                        if chunk.is_global_dedup_eligible() {
-                            let chunk_hash_bytes: [u8; 32] = chunk.chunk_hash.into();
-                            table.insert(&chunk_hash_bytes, &shard_hash_bytes)
-                                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert failed: {e}")))?;
-                        }
-                    }
-                }
+            for chunk_hash in shard.global_dedup_eligible_chunks() {
+                let chunk_hash_bytes: [u8; 32] = chunk_hash.into();
+                table.insert(&chunk_hash_bytes, &shard_hash_bytes)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert failed: {e}")))?;
             }
         }
         write_txn.commit()
