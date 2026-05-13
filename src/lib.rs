@@ -122,7 +122,13 @@ impl ShardIndex {
         Ok(())
     }
 
-    pub fn get_reconstruction(&self, py: Python<'_>, file_hash_hex: &str) -> PyResult<Option<Py<PyDict>>> {
+    pub fn get_reconstruction(
+        &self, 
+        py: Python<'_>, 
+        file_hash_hex: &str,
+        start_byte: Option<u64>,
+        end_byte: Option<u64>
+    ) -> PyResult<Option<Py<PyDict>>> {
         let h = MerkleHash::from_hex(file_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
 
@@ -131,17 +137,43 @@ impl ShardIndex {
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed: {e:?}")))?;
 
         if let Some((file_info, _shard_hash)) = res {
+            let start = start_byte.unwrap_or(0);
+            let end = end_byte;
+
             let dict = PyDict::new(py);
             let segments = PyList::empty(py);
+            
+            let mut current_offset = 0u64;
+            let mut offset_into_first_range = 0u64;
+            let mut found_first = false;
+
             for seg in file_info.segments {
-                let seg_dict = PyDict::new(py);
-                seg_dict.set_item("h", seg.xorb_hash.hex())?;
-                seg_dict.set_item("s", seg.chunk_index_start)?;
-                seg_dict.set_item("e", seg.chunk_index_end)?;
-                seg_dict.set_item("l", seg.unpacked_segment_bytes)?;
-                segments.append(seg_dict)?;
+                let seg_len = seg.unpacked_segment_bytes as u64;
+                let seg_end = current_offset + seg_len - 1;
+
+                // Check for overlap with [start, end]
+                if seg_end >= start && (end.is_none() || current_offset <= end.unwrap()) {
+                    if !found_first {
+                        offset_into_first_range = start.saturating_sub(current_offset);
+                        found_first = true;
+                    }
+                    
+                    let seg_dict = PyDict::new(py);
+                    seg_dict.set_item("h", seg.xorb_hash.hex())?;
+                    seg_dict.set_item("s", seg.chunk_index_start)?;
+                    seg_dict.set_item("e", seg.chunk_index_end)?;
+                    seg_dict.set_item("l", seg.unpacked_segment_bytes)?;
+                    segments.append(seg_dict)?;
+                }
+
+                current_offset += seg_len;
+                if let Some(e) = end {
+                    if current_offset > e { break; }
+                }
             }
+
             dict.set_item("segments", segments)?;
+            dict.set_item("offset_into_first_range", offset_into_first_range)?;
             return Ok(Some(dict.into()));
         }
 
