@@ -1,5 +1,4 @@
 use std::io::{Cursor, Seek};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use mdb_shard::metadata_shard::streaming_shard::MDBMinimalShard;
@@ -8,13 +7,15 @@ use mdb_shard::metadata_shard::{MDBShardInfo, MDBShardFileHeader, MDBShardFileFo
 use mdb_shard::metadata_shard::ShardFileManager;
 
 use mdb_shard::metadata_shard::shard_file_reconstructor::FileReconstructor;
-use mdb_shard::merklehash::{MerkleHash, file_hash, compute_data_hash};
-use mdb_shard::xorb_object::{reconstruct_xorb_with_footer, error::XorbObjectError};
-use xet_data::deduplication::Chunker;
+use mdb_shard::merklehash::{MerkleHash, compute_data_hash};
+use mdb_shard::xorb_object::reconstruct_xorb_with_footer;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::mem::size_of;
 use std::mem::swap;
+use std::io::Write;
+use futures::{StreamExt, TryStreamExt};
+use reqwest::Client;
 
 use redb::ReadableTable;
 const GLOBAL_DEDUP_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb::TableDefinition::new("global_dedup");
@@ -422,90 +423,85 @@ impl ShardIndex {
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Refresh failed: {e:?}")))?;
         Ok(())
     }
-}
 
-#[pyfunction]
-#[allow(unsafe_op_in_unsafe_fn)]
-pub fn extract_shard_metadata(
-    py: Python<'_>,
-    shard_bytes: &[u8],
-) -> PyResult<Py<PyDict>> {
-    // Parse shard (files AND XORB info)
-    let mut cursor = Cursor::new(shard_bytes);
-    let shard = MDBMinimalShard::from_reader(&mut cursor, true, true)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {e:?}")))?;
+    #[pyo3(signature = (tasks))]
+    pub fn reconstruct_file_parallel(
+        &self,
+        py: Python<'_>,
+        tasks: &PyList,
+    ) -> PyResult<PyObject> {
+        // tasks is a list of (url, byte_start, byte_end, unpacked_size)
+        let mut fetch_tasks = Vec::new();
+        let mut total_size = 0;
 
-    let root_dict = PyDict::new(py);
-
-    // 1. Files Index
-    let file_list = PyList::empty(py);
-    for i in 0..shard.num_files() {
-        if let Some(fiv) = shard.file(i) {
-            let file_dict = PyDict::new(py);
-            let h: MerkleHash = fiv.file_hash();
-            file_dict.set_item("file_hash", h.hex())?;
-            
-            let segments = PyList::empty(py);
-            for j in 0..fiv.num_entries() {
-                let seg = fiv.entry(j);
-                let seg_dict = PyDict::new(py);
-                let xh: MerkleHash = seg.xorb_hash;
-                seg_dict.set_item("h", xh.hex())?;
-                seg_dict.set_item("s", seg.chunk_index_start)?;
-                seg_dict.set_item("e", seg.chunk_index_end)?;
-                seg_dict.set_item("l", seg.unpacked_segment_bytes)?;
-                segments.append(seg_dict)?;
-            }
-            file_dict.set_item("segments", segments)?;
-            file_list.append(file_dict)?;
+        for item in tasks.iter() {
+            let task_tuple: (String, u64, u64, u32) = item.extract()?;
+            total_size += task_tuple.3 as usize;
+            fetch_tasks.push(task_tuple);
         }
-    }
-    root_dict.set_item("files", file_list)?;
 
-    // 2. XORB Index & 3. Global Dedup Chunks
-    let xorb_list = PyList::empty(py);
-    let mut eligible_chunks = HashSet::new();
+        if fetch_tasks.is_empty() {
+            return Ok(PyBytes::new(py, &[]).into());
+        }
 
-    for i in 0..shard.num_xorb() {
-        if let Some(xiv) = shard.xorb(i) {
-            let xorb_dict = PyDict::new(py);
-            let xh: MerkleHash = xiv.xorb_hash();
-            xorb_dict.set_item("xorb_hash", xh.hex())?;
+        let mut output_buffer = vec![0u8; total_size];
+
+        self.rt.block_on(async {
+            let client = Client::builder()
+                .danger_accept_invalid_certs(true)
+                .tcp_keepalive(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to build client: {}", e)))?;
             
-            let layout = PyList::empty(py);
-            for j in 0..xiv.num_entries() {
-                let chunk = xiv.chunk(j);
+            let mut futures = Vec::new();
+            for (url, b_start, b_end, unpacked_size) in fetch_tasks {
+                let client = client.clone();
+                futures.push(tokio::spawn(async move {
+                    // Fetch the exact byte range
+                    let resp = client.get(&url)
+                        .header("Range", format!("bytes={}-{}", b_start, b_end))
+                        .send()
+                        .await
+                        .map_err(|e| format!("Fetch failed for {}: {}", url, e))?;
+                    
+                    let stream = resp.bytes_stream();
+                    let mut decompressed = Vec::new();
+                    let mut writer = std::io::Cursor::new(&mut decompressed);
+                    
+                    let mut stream_reader = stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).into_async_read();
+                    let mut total_unpacked = 0u32;
+                    while total_unpacked < unpacked_size {
+                        let (_, unpacked_len) = mdb_shard::xorb_object::deserialize_async::deserialize_chunk_to_writer(&mut stream_reader, &mut writer).await
+                            .map_err(|e| format!("Decompression failed: {:?}", e))?;
+                        total_unpacked += unpacked_len;
+                    }
+                    
+                    Ok::<Vec<u8>, String>(decompressed)
+                }));
+            }
+            
+            let results = futures::future::join_all(futures).await;
+            
+            let mut final_offset = 0;
+            for res in results {
+                let data = res.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Task panicked: {}", e)))?
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
                 
-                // Add to XORB layout: [hash, offset, length]
-                let entry = PyList::empty(py);
-                let ch: MerkleHash = chunk.chunk_hash;
-                entry.append(ch.hex())?;
-                entry.append(chunk.chunk_byte_range_start)?;
-                entry.append(chunk.unpacked_segment_bytes)?;
-                layout.append(entry)?;
-
-                // Collect global dedup eligible chunks
-                if chunk.is_global_dedup_eligible() {
-                    let ch: MerkleHash = chunk.chunk_hash;
-                    eligible_chunks.insert(ch);
+                let len = data.len().min(total_size - final_offset);
+                if len > 0 {
+                    output_buffer[final_offset..final_offset + len].copy_from_slice(&data[..len]);
+                    final_offset += len;
                 }
             }
-            xorb_dict.set_item("chunk_layout", layout)?;
-            xorb_list.append(xorb_dict)?;
-        }
-    }
-    root_dict.set_item("xorbs", xorb_list)?;
+            
+            Ok::<(), PyErr>(())
+        })?;
 
-    // 4. Flattened Eligible Chunks
-    let chunk_list = PyList::empty(py);
-    for hash in eligible_chunks {
-        let ch: MerkleHash = hash;
-        chunk_list.append(ch.hex())?;
+        let bytes = PyBytes::new(py, &output_buffer);
+        Ok(bytes.into())
     }
-    root_dict.set_item("eligible_chunks", chunk_list)?;
-
-    Ok(root_dict.into_py(py))
 }
+
 
 #[pyfunction]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -570,67 +566,7 @@ pub fn merge_shards(
 
     Ok(dest_shards.into_py(py))
 }
-#[pyfunction]
-#[allow(unsafe_op_in_unsafe_fn)]
-pub fn create_shard(
-    py: Python<'_>,
-    xorb_hash_hex: &str,
-    total_size: u32,
-    chunk_layout: Vec<(&str, u32, u32)>, 
-) -> PyResult<Py<PyBytes>> {
-    use mdb_shard::merklehash::MerkleHash;
-    use mdb_shard::metadata_shard::xorb_structs::{MDBXorbInfo, XorbChunkSequenceHeader, XorbChunkSequenceEntry};
-    use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
 
-    let xorb_hash = MerkleHash::from_hex(xorb_hash_hex)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Bad XORB Hash: {:?}", e)))?;
-
-    let mut chunks = Vec::with_capacity(chunk_layout.len());
-    for (c_hash_hex, offset, length) in chunk_layout {
-        let chunk_hash = MerkleHash::from_hex(c_hash_hex)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Bad Chunk Hash: {:?}", e)))?;
-        let entry = XorbChunkSequenceEntry::new(chunk_hash, length, offset);
-        chunks.push(entry);
-    }
-
-    let header = XorbChunkSequenceHeader::new(xorb_hash, chunks.len() as u32, total_size);
-    let xorb_info = std::sync::Arc::new(MDBXorbInfo { metadata: header, chunks });
-
-    let mut shard = MDBInMemoryShard::default();
-    shard.add_xorb_block(xorb_info)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to add XORB: {:?}", e)))?;
-    
-    let shard_bytes = shard.to_bytes()
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to serialize shard: {:?}", e)))?;
-
-    Ok(PyBytes::new(py, &shard_bytes).into_py(py))
-}
-
-#[pyfunction]
-#[allow(unsafe_op_in_unsafe_fn)]
-pub fn calculate_file_hash(data: &[u8]) -> PyResult<String> {
-    let mut chunker = Chunker::default();
-    let chunks = chunker.next_block(data, true);
-    
-    let mut chunk_hashes = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        chunk_hashes.push((chunk.hash, chunk.data.len() as u64));
-    }
-    
-    let hash = file_hash(chunk_hashes.as_slice());
-    Ok(hash.hex())
-}
-
-#[pymodule]
-fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<ShardIndex>()?;
-    m.add_function(wrap_pyfunction!(extract_shard_metadata, m)?)?;
-    m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
-    m.add_function(wrap_pyfunction!(create_shard, m)?)?;
-    m.add_function(wrap_pyfunction!(calculate_file_hash, m)?)?;
-    m.add_function(wrap_pyfunction!(add_footer_to_xorb, m)?)?;
-    Ok(())
-}
 #[pyfunction]
 pub fn add_footer_to_xorb(py: Python<'_>, xorb_bytes: Vec<u8>) -> PyResult<PyObject> {
     let mut output = Vec::new();
@@ -643,4 +579,12 @@ pub fn add_footer_to_xorb(py: Python<'_>, xorb_bytes: Vec<u8>) -> PyResult<PyObj
             Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to reconstruct xorb with footer: {:?}", e)))
         }
     }
+}
+
+#[pymodule]
+fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<ShardIndex>()?;
+    m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
+    m.add_function(wrap_pyfunction!(add_footer_to_xorb, m)?)?;
+    Ok(())
 }
