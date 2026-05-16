@@ -26,6 +26,7 @@ pub struct ShardIndex {
     sfm: Arc<ShardFileManager>,
     rt: tokio::runtime::Runtime,
     db: Arc<redb::Database>,
+    client: Client,
 }
 
 #[pymethods]
@@ -42,10 +43,18 @@ impl ShardIndex {
         let db = redb::Database::create(db_path)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open redb: {e}")))?;
 
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to build client: {e}")))?;
+
         let index = ShardIndex {
             sfm,
             rt,
             db: Arc::new(db),
+            client,
         };
 
         // Trigger an initial refresh with the size limit
@@ -213,11 +222,7 @@ impl ShardIndex {
 
         if !fetch_tasks.is_empty() {
             let footers_res = self.rt.block_on(async {
-                let client = Client::builder()
-                    .danger_accept_invalid_certs(true)
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .map_err(|e| format!("Failed to build client: {e}"))?;
+                let client = self.client.clone();
 
                 let results: Vec<(MerkleHash, Option<Vec<u8>>)> = futures::stream::iter(fetch_tasks)
                     .map(|(xh, url)| {
@@ -355,11 +360,7 @@ impl ShardIndex {
         let mut output_buffer = vec![0u8; total_size];
 
         self.rt.block_on(async {
-            let client = Client::builder()
-                .danger_accept_invalid_certs(true)
-                .tcp_keepalive(std::time::Duration::from_secs(60))
-                .build()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to build client: {}", e)))?;
+            let client = self.client.clone();
             
             let mut futures = Vec::new();
             for (url, b_start, b_end, unpacked_size) in fetch_tasks {
