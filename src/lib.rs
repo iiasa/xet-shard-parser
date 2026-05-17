@@ -8,7 +8,7 @@ use mdb_shard::metadata_shard::ShardFileManager;
 
 use mdb_shard::metadata_shard::shard_file_reconstructor::FileReconstructor;
 use mdb_shard::merklehash::{MerkleHash, compute_data_hash};
-use mdb_shard::xorb_object::reconstruct_xorb_with_footer;
+use mdb_shard::xorb_object::{reconstruct_xorb_with_footer, XorbObject};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::mem::size_of;
@@ -20,6 +20,12 @@ use reqwest::Client;
 use redb::ReadableTable;
 const GLOBAL_DEDUP_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb::TableDefinition::new("global_dedup");
 
+fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
+    let mut reader = Cursor::new(bytes);
+    let xorb_obj = XorbObject::deserialize(&mut reader).ok()?;
+    let info = xorb_obj.info;
+    Some((info.chunk_hashes, info.chunk_boundary_offsets, info.unpacked_chunk_offsets))
+}
 
 #[pyclass]
 pub struct ShardIndex {
@@ -145,19 +151,15 @@ impl ShardIndex {
         let mut xorb_footers = std::collections::HashMap::new();
         
         if let Some(footers) = footers {
+            let mut raw_map = std::collections::HashMap::new();
             for (k, v) in footers.iter() {
-                let hash_hex: String = k.extract()?;
-                let bytes: &[u8] = v.extract()?;
-                
-                let hash = MerkleHash::from_hex(&hash_hex)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid footer hex {}: {:?}", hash_hex, e)))?;
-
-                let mut cursor = Cursor::new(bytes);
-                use mdb_shard::xorb_object::XorbObjectInfoV1;
-                let footer = match XorbObjectInfoV1::deserialize_only_boundaries_section(&mut cursor) {
-                    Ok((f, _)) => Some(f),
-                    Err(_) => None,
-                };
+                raw_map.insert(k.extract::<String>()?, v.extract::<&[u8]>()?);
+            }
+            
+            for (xh_hex, bytes) in raw_map {
+                let hash = MerkleHash::from_hex(&xh_hex)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+                let footer = parse_xorb_footer_data(bytes);
                 
                 xorb_footers.insert(hash, footer);
             }
@@ -202,6 +204,10 @@ impl ShardIndex {
             cumulative_bytes += n;
         }
 
+        println!("[Rust Cas Debug] needed_xorbs count: {}", needed_xorbs.len());
+        let keys = xorb_urls.keys();
+        println!("[Rust Cas Debug] xorb_urls keys: {:?}", keys);
+
         // Concurrenty fetch footers for required XORBs
         let mut xorb_footers = std::collections::HashMap::new();
         let mut fetch_tasks = Vec::new();
@@ -209,11 +215,17 @@ impl ShardIndex {
         for xh in needed_xorbs {
             let xh_hex = xh.hex();
             let mut found = false;
+            println!("[Rust Cas Debug] Looking up xh_hex: {}", xh_hex);
             if let Ok(Some(url_obj)) = xorb_urls.get_item(&xh_hex) {
                 if let Ok(url) = url_obj.extract::<String>() {
+                    println!("[Rust Cas Debug] Found URL: {}", url);
                     fetch_tasks.push((xh, url));
                     found = true;
+                } else {
+                    println!("[Rust Cas Debug] Failed to extract URL string");
                 }
+            } else {
+                println!("[Rust Cas Debug] xorb_urls does not contain {}", xh_hex);
             }
             if !found {
                 xorb_footers.insert(xh, None);
@@ -230,7 +242,7 @@ impl ShardIndex {
                         async move {
                             // Fetch last 64KB for footer
                             let resp = client.get(&url)
-                                .header("Range", "bytes=-65536")
+                                .header("Range", "bytes=-1048576")
                                 .send()
                                 .await;
                             
@@ -239,7 +251,14 @@ impl ShardIndex {
                                     let bytes = r.bytes().await.ok().map(|b| b.to_vec());
                                     (xh, bytes)
                                 }
-                                _ => (xh, None),
+                                Ok(r) => {
+                                    eprintln!("[Rust Cas Debug] Fetch footer failed for {}: status={}", url, r.status());
+                                    (xh, None)
+                                }
+                                Err(e) => {
+                                    eprintln!("[Rust Cas Debug] Fetch footer request failed for {}: error={}", url, e);
+                                    (xh, None)
+                                }
                             }
                         }
                     })
@@ -251,11 +270,7 @@ impl ShardIndex {
             }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
 
             for (xh, bytes_opt) in footers_res {
-                let footer = bytes_opt.and_then(|bytes| {
-                    let mut cursor = Cursor::new(bytes);
-                    use mdb_shard::xorb_object::XorbObjectInfoV1;
-                    XorbObjectInfoV1::deserialize_only_boundaries_section(&mut cursor).ok().map(|(f, _)| f)
-                });
+                let footer = bytes_opt.and_then(|bytes| parse_xorb_footer_data(&bytes));
                 xorb_footers.insert(xh, footer);
             }
         }
@@ -362,44 +377,52 @@ impl ShardIndex {
         self.rt.block_on(async {
             let client = self.client.clone();
             
-            let mut futures = Vec::new();
-            for (url, b_start, b_end, unpacked_size) in fetch_tasks {
-                let client = client.clone();
-                futures.push(tokio::spawn(async move {
-                    // Fetch the exact byte range
-                    let resp = client.get(&url)
-                        .header("Range", format!("bytes={}-{}", b_start, b_end))
-                        .send()
-                        .await
-                        .map_err(|e| format!("Fetch failed for {}: {}", url, e))?;
-                    
-                    let stream = resp.bytes_stream();
-                    let mut decompressed = Vec::new();
-                    let mut writer = std::io::Cursor::new(&mut decompressed);
-                    
-                    let mut stream_reader = stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).into_async_read();
-                    let mut total_unpacked = 0u32;
-                    while total_unpacked < unpacked_size {
-                        let (_, unpacked_len) = mdb_shard::xorb_object::deserialize_async::deserialize_chunk_to_writer(&mut stream_reader, &mut writer).await
-                            .map_err(|e| format!("Decompression failed: {:?}", e))?;
-                        total_unpacked += unpacked_len;
-                    }
-                    
-                    Ok::<Vec<u8>, String>(decompressed)
-                }));
+            let mut results: Vec<Result<Vec<u8>, String>> = Vec::new();
+            if !fetch_tasks.is_empty() {
+                results = futures::stream::iter(fetch_tasks)
+                    .map(|(url, b_start, b_end, unpacked_size)| {
+                        let client = client.clone();
+                        async move {
+                            // Fetch the exact byte range
+                            let resp = client.get(&url)
+                                .header("Range", format!("bytes={}-{}", b_start, b_end))
+                                .send()
+                                .await
+                                .map_err(|e| format!("Fetch failed for {}: {}", url, e))?;
+                            
+                            let mut decompressed = Vec::new();
+                            let mut writer = std::io::Cursor::new(&mut decompressed);
+                            
+                            let mut stream_reader = resp.bytes_stream()
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                                .into_async_read();
+                                
+                            let mut total_unpacked = 0u32;
+                            while total_unpacked < unpacked_size {
+                                let (_, unpacked_len) = mdb_shard::xorb_object::deserialize_async::deserialize_chunk_to_writer(&mut stream_reader, &mut writer).await
+                                    .map_err(|e| format!("Decompression failed: {:?}", e))?;
+                                total_unpacked += unpacked_len;
+                            }
+                            
+                            Ok::<Vec<u8>, String>(decompressed)
+                        }
+                    })
+                    .buffered(16) // Limit concurrency to 16 requests per batch
+                    .collect::<Vec<_>>()
+                    .await;
             }
-            
-            let results = futures::future::join_all(futures).await;
             
             let mut final_offset = 0;
             for res in results {
-                let data = res.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Task panicked: {}", e)))?
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-                
-                let len = data.len().min(total_size - final_offset);
-                if len > 0 {
-                    output_buffer[final_offset..final_offset + len].copy_from_slice(&data[..len]);
-                    final_offset += len;
+                match res {
+                    Ok(data) => {
+                        let len = data.len().min(total_size - final_offset);
+                        if len > 0 {
+                            output_buffer[final_offset..final_offset + len].copy_from_slice(&data[..len]);
+                            final_offset += len;
+                        }
+                    }
+                    Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
                 }
             }
             
@@ -418,7 +441,7 @@ impl ShardIndex {
         file_hash_hex: &str,
         start_byte: Option<u64>,
         end_byte: Option<u64>,
-        xorb_footers: std::collections::HashMap<MerkleHash, Option<mdb_shard::xorb_object::XorbObjectInfoV1>>,
+        xorb_footers: std::collections::HashMap<MerkleHash, Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)>>,
     ) -> PyResult<Option<Py<PyDict>>> {
         let h = MerkleHash::from_hex(file_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
@@ -447,27 +470,6 @@ impl ShardIndex {
             return Ok(None);
         }
 
-        let mut s_idx = 0;
-        let mut cumulative_bytes = 0u64;
-        let mut first_chunk_byte_start = 0u64;
-
-        loop {
-            if s_idx >= file_info.segments.len() {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid range"));
-            }
-
-            let n = file_info.segments[s_idx].unpacked_segment_bytes as u64;
-            if cumulative_bytes + n > file_range_start {
-                first_chunk_byte_start = cumulative_bytes;
-                break;
-            } else {
-                cumulative_bytes += n;
-                s_idx += 1;
-            }
-        }
-
-        let mut terms = Vec::new();
-
         #[derive(Clone)]
         struct FetchInfoIntermediate {
             chunk_range_start: u32,
@@ -478,83 +480,59 @@ impl ShardIndex {
 
         let mut fetch_info_map: std::collections::HashMap<MerkleHash, Vec<FetchInfoIntermediate>> = std::collections::HashMap::new();
 
-        while s_idx < file_info.segments.len() && cumulative_bytes <= file_range_end {
-            let mut segment = file_info.segments[s_idx].clone();
-            let mut chunk_range_start = segment.chunk_index_start;
-            let mut chunk_range_end = segment.chunk_index_end;
+        let mut cumulative_bytes = 0u64;
+        let mut first_found = false;
+        let mut first_chunk_byte_start = 0u64;
+        let mut terms = Vec::new();
 
-            let xorb_footer_opt = xorb_footers.get(&segment.xorb_hash).cloned().flatten();
-
-            let has_footer = xorb_footer_opt.is_some();
-
-            let get_chunk_length = |idx: u32| -> PyResult<u32> {
-                if let Some(ref footer) = xorb_footer_opt {
-                    if idx == 0 {
-                        Ok(footer.unpacked_chunk_offsets[0])
-                    } else if (idx as usize) < footer.unpacked_chunk_offsets.len() {
-                        Ok(footer.unpacked_chunk_offsets[idx as usize] - footer.unpacked_chunk_offsets[(idx - 1) as usize])
-                    } else {
-                        Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Chunk index out of bounds in unpacked_chunk_offsets"))
-                    }
-                } else {
-                    Ok(0)
-                }
-            };
-
-            if has_footer {
-                if cumulative_bytes < file_range_start {
-                    while chunk_range_start < chunk_range_end {
-                        let next_chunk_size = get_chunk_length(chunk_range_start)? as u64;
-                        if cumulative_bytes + next_chunk_size <= file_range_start {
-                            cumulative_bytes += next_chunk_size;
-                            first_chunk_byte_start += next_chunk_size;
-                            segment.unpacked_segment_bytes -= next_chunk_size as u32;
-                            chunk_range_start += 1;
-                        } else {
-                            break;
-                        }
-                    }
+        for segment in &file_info.segments {
+            let seg_unpacked_len = segment.unpacked_segment_bytes as u64;
+            
+            // Intersection check: segment covers [cumulative_bytes, cumulative_bytes + seg_unpacked_len)
+            if cumulative_bytes + seg_unpacked_len > file_range_start && cumulative_bytes < file_range_end {
+                
+                if !first_found {
+                    first_chunk_byte_start = cumulative_bytes;
+                    first_found = true;
                 }
 
-                if cumulative_bytes + segment.unpacked_segment_bytes as u64 > file_range_end {
-                    while chunk_range_end > chunk_range_start {
-                        let last_chunk_size = get_chunk_length(chunk_range_end - 1)? as u64;
-                        if cumulative_bytes + (segment.unpacked_segment_bytes - last_chunk_size as u32) as u64 >= file_range_end {
-                            chunk_range_end -= 1;
-                            segment.unpacked_segment_bytes -= last_chunk_size as u32;
-                        } else {
-                            break;
-                        }
-                    }
+                let xorb_footer_opt = xorb_footers.get(&segment.xorb_hash).and_then(|f| f.as_ref());
+                
+                let chunk_range_start = segment.chunk_index_start;
+                let chunk_range_end = segment.chunk_index_end;
+                
+                let mut unpacked_len = segment.unpacked_segment_bytes;
+                
+                if let Some((_f_hashes, f_boundaries, f_unpacked)) = xorb_footer_opt {
+                    let start_unpacked = if chunk_range_start == 0 { 0 } else { f_unpacked[(chunk_range_start - 1) as usize] };
+                    let end_unpacked = if chunk_range_end == 0 { 0 } else { f_unpacked[(chunk_range_end - 1) as usize] };
+                    unpacked_len = (end_unpacked - start_unpacked) as u32;
+
+                    let start_byte = if chunk_range_start == 0 { 0 } else { f_boundaries[(chunk_range_start - 1) as usize] };
+                    let end_byte = if chunk_range_end == 0 { 0 } else { f_boundaries[(chunk_range_end - 1) as usize] };
+
+                    fetch_info_map
+                        .entry(segment.xorb_hash)
+                        .or_default()
+                        .push(FetchInfoIntermediate {
+                            chunk_range_start,
+                            chunk_range_end,
+                            byte_range_start: start_byte as u64,
+                            byte_range_end: end_byte as u64,
+                        });
                 }
+
+                let term_dict = PyDict::new(py);
+                term_dict.set_item("hash", segment.xorb_hash.hex())?;
+                term_dict.set_item("unpacked_length", unpacked_len)?;
+                let range_dict = PyDict::new(py);
+                range_dict.set_item("start", chunk_range_start)?;
+                range_dict.set_item("end", chunk_range_end)?;
+                term_dict.set_item("range", range_dict)?;
+                terms.push(term_dict);
             }
-
-            if let Some(ref footer) = xorb_footer_opt {
-                let start_byte = if chunk_range_start == 0 { 0 } else { footer.chunk_boundary_offsets[(chunk_range_start - 1) as usize] };
-                let end_byte = if chunk_range_end == 0 { 0 } else { footer.chunk_boundary_offsets[(chunk_range_end - 1) as usize] };
-
-                fetch_info_map
-                    .entry(segment.xorb_hash)
-                    .or_default()
-                    .push(FetchInfoIntermediate {
-                        chunk_range_start,
-                        chunk_range_end,
-                        byte_range_start: start_byte as u64,
-                        byte_range_end: end_byte as u64,
-                    });
-            }
-
-            let term_dict = PyDict::new(py);
-            term_dict.set_item("hash", segment.xorb_hash.hex())?;
-            term_dict.set_item("unpacked_length", segment.unpacked_segment_bytes)?;
-            let range_dict = PyDict::new(py);
-            range_dict.set_item("start", chunk_range_start)?;
-            range_dict.set_item("end", chunk_range_end)?;
-            term_dict.set_item("range", range_dict)?;
-            terms.push(term_dict);
-
-            cumulative_bytes += segment.unpacked_segment_bytes as u64;
-            s_idx += 1;
+            
+            cumulative_bytes += seg_unpacked_len;
         }
 
         let py_terms = PyList::empty(py);
@@ -563,40 +541,24 @@ impl ShardIndex {
         }
 
         let py_fetch_info = PyDict::new(py);
-        for (hash, mut fi_vec) in fetch_info_map {
-            fi_vec.sort_by_key(|fi| fi.chunk_range_start);
-            
-            let merged_list = PyList::empty(py);
-            let mut idx = 0;
-            while idx < fi_vec.len() {
-                let mut new_fi = fi_vec[idx].clone();
-                while idx + 1 < fi_vec.len() {
-                    let next_fi = &fi_vec[idx + 1];
-                    if next_fi.chunk_range_start <= new_fi.chunk_range_end {
-                        new_fi.chunk_range_end = next_fi.chunk_range_end.max(new_fi.chunk_range_end);
-                        new_fi.byte_range_end = next_fi.byte_range_end.max(new_fi.byte_range_end);
-                        idx += 1;
-                    } else {
-                        break;
-                    }
-                }
-                
+        for (hash, fi_vec) in fetch_info_map {
+            let list = PyList::empty(py);
+            for fi in fi_vec {
                 let fi_dict = PyDict::new(py);
                 let cr_dict = PyDict::new(py);
-                cr_dict.set_item("start", new_fi.chunk_range_start)?;
-                cr_dict.set_item("end", new_fi.chunk_range_end)?;
+                cr_dict.set_item("start", fi.chunk_range_start)?;
+                cr_dict.set_item("end", fi.chunk_range_end)?;
                 fi_dict.set_item("range", cr_dict)?;
                 
                 let ur_dict = PyDict::new(py);
-                ur_dict.set_item("start", new_fi.byte_range_start)?;
-                ur_dict.set_item("end", new_fi.byte_range_end.saturating_sub(1))?; // HttpRange is inclusive end
+                ur_dict.set_item("start", fi.byte_range_start)?;
+                ur_dict.set_item("end", fi.byte_range_end.saturating_sub(1))?; // HttpRange is inclusive end
                 fi_dict.set_item("url_range", ur_dict)?;
                 
                 fi_dict.set_item("url", format!("s3://{}/xorbs/{}", "BUCKET", hash.hex()))?;
-                merged_list.append(fi_dict)?;
-                idx += 1;
+                list.append(fi_dict)?;
             }
-            py_fetch_info.set_item(hash.hex(), merged_list)?;
+            py_fetch_info.set_item(hash.hex(), list)?;
         }
 
         let result = PyDict::new(py);
