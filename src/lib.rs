@@ -649,10 +649,50 @@ pub fn add_footer_to_xorb(py: Python<'_>, xorb_bytes: Vec<u8>) -> PyResult<PyObj
     }
 }
 
+#[pyfunction]
+pub fn reconstruct_shard(py: Python<'_>, shard_bytes: &[u8]) -> PyResult<PyObject> {
+    let header = MDBShardFileHeader::deserialize(&mut Cursor::new(shard_bytes))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse header: {e:?}")))?;
+
+    if header.footer_size == 0 {
+        use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
+        use mdb_shard::metadata_shard::file_structs::MDBFileInfo;
+        use mdb_shard::metadata_shard::xorb_structs::MDBXorbInfo;
+
+        let mut cursor = Cursor::new(shard_bytes);
+        let minimal_shard = MDBMinimalShard::from_reader(&mut cursor, true, true)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse minimal shard: {e:?}")))?;
+        
+        let mut in_memory_shard = MDBInMemoryShard::default();
+        for i in 0..minimal_shard.num_files() {
+            if let Some(file_view) = minimal_shard.file(i) {
+                let file_info = MDBFileInfo::from(file_view);
+                in_memory_shard.add_file_reconstruction_info(file_info)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to add file reconstruction info: {e:?}")))?;
+            }
+        }
+        for i in 0..minimal_shard.num_xorb() {
+            if let Some(xorb_view) = minimal_shard.xorb(i) {
+                let xorb_info = MDBXorbInfo::from(xorb_view);
+                in_memory_shard.add_xorb_block(xorb_info)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to add xorb block: {e:?}")))?;
+            }
+        }
+        let reconstructed = in_memory_shard.to_bytes()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to serialize in-memory shard: {e:?}")))?;
+        let bytes = pyo3::types::PyBytes::new(py, &reconstructed);
+        Ok(bytes.into())
+    } else {
+        let bytes = pyo3::types::PyBytes::new(py, shard_bytes);
+        Ok(bytes.into())
+    }
+}
+
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ShardIndex>()?;
     m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
     m.add_function(wrap_pyfunction!(add_footer_to_xorb, m)?)?;
+    m.add_function(wrap_pyfunction!(reconstruct_shard, m)?)?;
     Ok(())
 }
