@@ -541,9 +541,31 @@ impl ShardIndex {
         }
 
         let py_fetch_info = PyDict::new(py);
-        for (hash, fi_vec) in fetch_info_map {
-            let list = PyList::empty(py);
+        for (hash, mut fi_vec) in fetch_info_map {
+            if fi_vec.is_empty() {
+                continue;
+            }
+            // Sort by chunk range start
+            fi_vec.sort_by_key(|fi| fi.chunk_range_start);
+            
+            // Coalesce adjacent/overlapping entries
+            let mut coalesced: Vec<FetchInfoIntermediate> = Vec::new();
             for fi in fi_vec {
+                if coalesced.is_empty() {
+                    coalesced.push(fi);
+                } else {
+                    let last = coalesced.last_mut().unwrap();
+                    if last.chunk_range_end >= fi.chunk_range_start {
+                        last.chunk_range_end = last.chunk_range_end.max(fi.chunk_range_end);
+                        last.byte_range_end = last.byte_range_end.max(fi.byte_range_end);
+                    } else {
+                        coalesced.push(fi);
+                    }
+                }
+            }
+
+            let list = PyList::empty(py);
+            for fi in coalesced {
                 let fi_dict = PyDict::new(py);
                 let cr_dict = PyDict::new(py);
                 cr_dict.set_item("start", fi.chunk_range_start)?;
