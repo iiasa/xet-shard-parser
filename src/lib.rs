@@ -139,7 +139,7 @@ impl ShardIndex {
         Ok(())
     }
 
-    #[pyo3(signature = (file_hash_hex, start_byte=None, end_byte=None, footers=None))]
+    #[pyo3(signature = (file_hash_hex, start_byte=None, end_byte=None, footers=None, coalesce=None))]
     pub fn calculate_reconstruction(
         &self,
         py: Python<'_>,
@@ -147,6 +147,7 @@ impl ShardIndex {
         start_byte: Option<u64>,
         end_byte: Option<u64>,
         footers: Option<&PyDict>,
+        coalesce: Option<bool>,
     ) -> PyResult<Option<Py<PyDict>>> {
         let mut xorb_footers = std::collections::HashMap::new();
         
@@ -165,10 +166,10 @@ impl ShardIndex {
             }
         }
 
-        self.calculate_reconstruction_internal(py, file_hash_hex, start_byte, end_byte, xorb_footers)
+        self.calculate_reconstruction_internal(py, file_hash_hex, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true))
     }
 
-    #[pyo3(signature = (file_hash_hex, start_byte, end_byte, xorb_urls))]
+    #[pyo3(signature = (file_hash_hex, start_byte, end_byte, xorb_urls, coalesce=None))]
     pub fn calculate_reconstruction_with_urls(
         &self,
         py: Python<'_>,
@@ -176,6 +177,7 @@ impl ShardIndex {
         start_byte: Option<u64>,
         end_byte: Option<u64>,
         xorb_urls: &PyDict,
+        coalesce: Option<bool>,
     ) -> PyResult<Option<Py<PyDict>>> {
         let h = MerkleHash::from_hex(file_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
@@ -275,7 +277,7 @@ impl ShardIndex {
             }
         }
 
-        self.calculate_reconstruction_internal(py, file_hash_hex, start_byte, end_byte, xorb_footers)
+        self.calculate_reconstruction_internal(py, file_hash_hex, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true))
     }
 
     pub fn get_chunk_shard(&self, chunk_hash_hex: &str) -> PyResult<Option<String>> {
@@ -442,6 +444,7 @@ impl ShardIndex {
         start_byte: Option<u64>,
         end_byte: Option<u64>,
         xorb_footers: std::collections::HashMap<MerkleHash, Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)>>,
+        coalesce: bool,
     ) -> PyResult<Option<Py<PyDict>>> {
         let h = MerkleHash::from_hex(file_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
@@ -545,27 +548,33 @@ impl ShardIndex {
             if fi_vec.is_empty() {
                 continue;
             }
-            // Sort by chunk range start
-            fi_vec.sort_by_key(|fi| fi.chunk_range_start);
             
-            // Coalesce adjacent/overlapping entries
-            let mut coalesced: Vec<FetchInfoIntermediate> = Vec::new();
-            for fi in fi_vec {
-                if coalesced.is_empty() {
-                    coalesced.push(fi);
-                } else {
-                    let last = coalesced.last_mut().unwrap();
-                    if last.chunk_range_end >= fi.chunk_range_start {
-                        last.chunk_range_end = last.chunk_range_end.max(fi.chunk_range_end);
-                        last.byte_range_end = last.byte_range_end.max(fi.byte_range_end);
-                    } else {
+            let final_entries = if coalesce {
+                // Sort by chunk range start
+                fi_vec.sort_by_key(|fi| fi.chunk_range_start);
+                
+                // Coalesce adjacent/overlapping entries
+                let mut coalesced: Vec<FetchInfoIntermediate> = Vec::new();
+                for fi in fi_vec {
+                    if coalesced.is_empty() {
                         coalesced.push(fi);
+                    } else {
+                        let last = coalesced.last_mut().unwrap();
+                        if last.chunk_range_end >= fi.chunk_range_start {
+                            last.chunk_range_end = last.chunk_range_end.max(fi.chunk_range_end);
+                            last.byte_range_end = last.byte_range_end.max(fi.byte_range_end);
+                        } else {
+                            coalesced.push(fi);
+                        }
                     }
                 }
-            }
+                coalesced
+            } else {
+                fi_vec
+            };
 
             let list = PyList::empty(py);
-            for fi in coalesced {
+            for fi in final_entries {
                 let fi_dict = PyDict::new(py);
                 let cr_dict = PyDict::new(py);
                 cr_dict.set_item("start", fi.chunk_range_start)?;
