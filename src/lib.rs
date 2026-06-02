@@ -69,6 +69,37 @@ impl ShardIndex {
         Ok(index)
     }
 
+    pub fn get_all_shard_xorbs(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let shards = self.rt.block_on(async {
+            self.sfm.registered_shard_list().await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
+
+        let dict = PyDict::new(py);
+
+        for shard_file in shards {
+            let mut reader = match shard_file.get_reader() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            
+            let m_shard = match MDBMinimalShard::from_reader(&mut reader, false, true) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            
+            let xorbs_list = PyList::empty(py);
+            for i in 0..m_shard.num_xorb() {
+                if let Some(xiv) = m_shard.xorb(i) {
+                    let h_hex = xiv.xorb_hash().hex();
+                    let _ = xorbs_list.append(h_hex);
+                }
+            }
+            let _ = dict.set_item(shard_file.shard_hash.hex(), xorbs_list);
+        }
+
+        Ok(dict.into())
+    }
+
     pub fn prune_shard(&self, shard_hash_hex: &str) -> PyResult<()> {
         let h = MerkleHash::from_hex(shard_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
