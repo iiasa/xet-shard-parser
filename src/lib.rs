@@ -644,54 +644,35 @@ pub fn merge_shards(
         return Ok(PyList::empty(py).into_py(py));
     }
 
-    let mut cur_data = Vec::<u8>::with_capacity(target_max_size as usize);
-    let mut next_data = Vec::<u8>::with_capacity(target_max_size as usize);
-    let mut out_data = Vec::<u8>::with_capacity(target_max_size as usize);
+    use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
 
     let dest_shards = PyList::empty(py);
-    let mut cur_si = MDBShardInfo::default();
+    let mut current_shard = MDBInMemoryShard::default();
 
     for data in shard_list {
-        next_data = data;
-        let mut cursor = Cursor::new(&next_data);
-        
-        // Use MDBShardInfo::load_from_reader to get header and footer metadata.
-        // This is required for shard_set_union.
-        let shard_info = MDBShardInfo::load_from_reader(&mut cursor)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {e:?}")))?;
+        let parsed_shard = bytes_to_in_memory_shard(&data)?;
 
-        if cur_data.is_empty() {
-            // Starting from scratch with the first shard
-            swap(&mut cur_data, &mut next_data);
-            cur_si = shard_info;
-        } else if cur_data.len() + next_data.len() - (size_of::<MDBShardFileHeader>() + size_of::<MDBShardFileFooter>())
-            <= target_max_size as usize
-        {
-            // We have enough size capacity to merge this one in.
-            out_data.clear();
-            cur_si = shard_set_union(
-                &cur_si,
-                &mut Cursor::new(&cur_data),
-                &shard_info,
-                &mut Cursor::new(&next_data),
-                &mut out_data,
-            ).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Merge error: {e:?}")))?;
-
-            // Now swap out the destination data with the current data.
-            swap(&mut out_data, &mut cur_data);
+        if current_shard.is_empty() {
+            current_shard = parsed_shard;
         } else {
-            // Current buffer is full or would be too large; "flush" it and start new.
-            dest_shards.append(PyBytes::new(py, &cur_data))?;
+            let candidate = current_shard.union(&parsed_shard)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Union error: {e:?}")))?;
 
-            // Move the loaded data into the current buffer.
-            swap(&mut cur_data, &mut next_data);
-            cur_si = shard_info;
+            if candidate.shard_file_size() <= target_max_size {
+                current_shard = candidate;
+            } else {
+                let out_bytes = current_shard.to_bytes()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
+                dest_shards.append(PyBytes::new(py, &out_bytes))?;
+                current_shard = parsed_shard;
+            }
         }
     }
 
-    // If there is any left over at the end, flush that as well.
-    if !cur_data.is_empty() {
-        dest_shards.append(PyBytes::new(py, &cur_data))?;
+    if !current_shard.is_empty() {
+        let out_bytes = current_shard.to_bytes()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
+        dest_shards.append(PyBytes::new(py, &out_bytes))?;
     }
 
     Ok(dest_shards.into_py(py))
@@ -711,35 +692,39 @@ pub fn add_footer_to_xorb(py: Python<'_>, xorb_bytes: Vec<u8>) -> PyResult<PyObj
     }
 }
 
+fn bytes_to_in_memory_shard(shard_bytes: &[u8]) -> PyResult<mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard> {
+    use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
+    use mdb_shard::metadata_shard::file_structs::MDBFileInfo;
+    use mdb_shard::metadata_shard::xorb_structs::MDBXorbInfo;
+
+    let mut cursor = Cursor::new(shard_bytes);
+    let minimal_shard = MDBMinimalShard::from_reader(&mut cursor, true, true)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse minimal shard: {e:?}")))?;
+    
+    let mut in_memory_shard = MDBInMemoryShard::default();
+    for i in 0..minimal_shard.num_files() {
+        if let Some(file_view) = minimal_shard.file(i) {
+            in_memory_shard.add_file_reconstruction_info(MDBFileInfo::from(file_view))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to add file info: {e:?}")))?;
+        }
+    }
+    for i in 0..minimal_shard.num_xorb() {
+        if let Some(xorb_view) = minimal_shard.xorb(i) {
+            in_memory_shard.add_xorb_block(MDBXorbInfo::from(xorb_view))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to add xorb info: {e:?}")))?;
+        }
+    }
+    
+    Ok(in_memory_shard)
+}
+
 #[pyfunction]
 pub fn reconstruct_shard(py: Python<'_>, shard_bytes: &[u8]) -> PyResult<PyObject> {
     let header = MDBShardFileHeader::deserialize(&mut Cursor::new(shard_bytes))
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse header: {e:?}")))?;
 
     if header.footer_size == 0 {
-        use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
-        use mdb_shard::metadata_shard::file_structs::MDBFileInfo;
-        use mdb_shard::metadata_shard::xorb_structs::MDBXorbInfo;
-
-        let mut cursor = Cursor::new(shard_bytes);
-        let minimal_shard = MDBMinimalShard::from_reader(&mut cursor, true, true)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse minimal shard: {e:?}")))?;
-        
-        let mut in_memory_shard = MDBInMemoryShard::default();
-        for i in 0..minimal_shard.num_files() {
-            if let Some(file_view) = minimal_shard.file(i) {
-                let file_info = MDBFileInfo::from(file_view);
-                in_memory_shard.add_file_reconstruction_info(file_info)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to add file reconstruction info: {e:?}")))?;
-            }
-        }
-        for i in 0..minimal_shard.num_xorb() {
-            if let Some(xorb_view) = minimal_shard.xorb(i) {
-                let xorb_info = MDBXorbInfo::from(xorb_view);
-                in_memory_shard.add_xorb_block(xorb_info)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to add xorb block: {e:?}")))?;
-            }
-        }
+        let in_memory_shard = bytes_to_in_memory_shard(shard_bytes)?;
         let reconstructed = in_memory_shard.to_bytes()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to serialize in-memory shard: {e:?}")))?;
         let bytes = pyo3::types::PyBytes::new(py, &reconstructed);
