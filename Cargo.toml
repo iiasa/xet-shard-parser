@@ -17,7 +17,7 @@ xet_client = { package = "xet-client", git = "https://github.com/huggingface/xet
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-redb = "2"
+redb = "3.1"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
