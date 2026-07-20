@@ -17,7 +17,7 @@ use std::io::Write;
 use futures::{StreamExt, TryStreamExt};
 use reqwest::Client;
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 const GLOBAL_DEDUP_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb::TableDefinition::new("global_dedup");
 
 fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
