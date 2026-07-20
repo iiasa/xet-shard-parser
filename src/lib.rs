@@ -42,8 +42,11 @@ impl ShardIndex {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create tokio runtime: {e}")))?;
         
+        let ctx = xet_runtime::core::context::XetContext::default()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to initialize XetContext: {e:?}")))?;
+
         let sfm = rt.block_on(async {
-            ShardFileManager::new_in_cache_directory(cache_dir).await
+            ShardFileManager::new_in_cache_directory(&ctx, cache_dir).await
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to init ShardFileManager: {e:?}")))?;
 
         let db = redb::Database::create(db_path)
