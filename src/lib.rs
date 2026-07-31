@@ -682,9 +682,9 @@ pub fn merge_shards(
 }
 
 #[pyfunction]
-pub fn add_footer_to_xorb(py: Python<'_>, xorb_bytes: Vec<u8>) -> PyResult<PyObject> {
+pub fn add_footer_to_xorb(py: Python<'_>, xorb_bytes: &[u8]) -> PyResult<PyObject> {
     let mut output = Vec::new();
-    match reconstruct_xorb_with_footer(&mut output, &xorb_bytes) {
+    match reconstruct_xorb_with_footer(&mut output, xorb_bytes) {
         Ok(_) => {
             let bytes = pyo3::types::PyBytes::new(py, &output);
             Ok(bytes.into())
