@@ -7,18 +7,26 @@ use mdb_shard::metadata_shard::{MDBShardInfo, MDBShardFileHeader, MDBShardFileFo
 use mdb_shard::metadata_shard::ShardFileManager;
 
 use mdb_shard::metadata_shard::shard_file_reconstructor::FileReconstructor;
+use mdb_shard::metadata_shard::xorb_structs::{MDBXorbInfo, XorbChunkSequenceHeader, XorbChunkSequenceEntry};
 use mdb_shard::merklehash::{MerkleHash, compute_data_hash};
 use mdb_shard::xorb_object::{reconstruct_xorb_with_footer, XorbObject};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata};
+
+mod blender;
 use std::mem::size_of;
 use std::mem::swap;
 use std::io::Write;
 use futures::{StreamExt, TryStreamExt};
 use reqwest::Client;
 
-use redb::{ReadableDatabase, ReadableTable};
 const GLOBAL_DEDUP_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb::TableDefinition::new("global_dedup");
+const GC_LIVE_CHUNKS_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_live_chunks");
+const GC_PRIMARY_XORB_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb::TableDefinition::new("gc_primary_xorb");
+const GC_XORB_UTILIZATION_TABLE: redb::TableDefinition<&[u8; 32], &str> = redb::TableDefinition::new("gc_xorb_utilization");
+const GC_SPARSE_XORBS_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_sparse_xorbs");
+const GC_LIVE_FILES_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_live_files");
 
 fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
     let mut reader = Cursor::new(bytes);
@@ -33,6 +41,7 @@ pub struct ShardIndex {
     rt: tokio::runtime::Runtime,
     db: Arc<redb::Database>,
     client: Client,
+    gc_db: Arc<std::sync::RwLock<Option<redb::Database>>>,
 }
 
 #[pymethods]
@@ -64,6 +73,7 @@ impl ShardIndex {
             rt,
             db: Arc::new(db),
             client,
+            gc_db: Arc::new(std::sync::RwLock::new(None)),
         };
 
         // Trigger an initial refresh with the size limit
@@ -101,6 +111,100 @@ impl ShardIndex {
         }
 
         Ok(dict.into())
+    }
+
+    #[pyo3(signature = (xorb_hashes))]
+    pub fn get_shards_for_xorbs(&self, py: Python<'_>, xorb_hashes: Vec<String>) -> PyResult<std::collections::HashSet<String>> {
+        let mut target_xorbs: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        for hex in xorb_hashes {
+            if let Ok(mh) = MerkleHash::from_hex(&hex) {
+                target_xorbs.insert(mh.into());
+            }
+        }
+        
+        let shards = self.rt.block_on(async {
+            self.sfm.registered_shard_list().await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
+
+        let mut matching_shards = std::collections::HashSet::new();
+
+        for shard_file in shards {
+            let mut reader = match shard_file.get_reader() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            
+            let m_shard = match MDBMinimalShard::from_reader(&mut reader, false, true) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            
+            for i in 0..m_shard.num_xorb() {
+                if let Some(xiv) = m_shard.xorb(i) {
+                    let h: [u8; 32] = xiv.xorb_hash().into();
+                    if target_xorbs.contains(&h) {
+                        matching_shards.insert(shard_file.shard_hash.hex());
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(matching_shards)
+    }
+
+
+
+    #[pyo3(signature = ())]
+    pub fn start_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
+        let gc_db_lock = self.gc_db.read().unwrap();
+        if gc_db_lock.is_none() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized"));
+        }
+        let db = gc_db_lock.as_ref().unwrap();
+        let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+        let sparse_xorbs = read_txn.open_table(blender::GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
+        
+        if sparse_xorbs.is_empty().unwrap_or(true) {
+            return Ok(false);
+        }
+        
+        drop(read_txn);
+        drop(gc_db_lock);
+        
+        blender::_consolidate_metadata(py, self.sfm.clone(), self.gc_db.clone())?;
+        
+        Ok(true)
+    }
+
+    #[pyo3(signature = ())]
+    pub fn stage_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
+        blender::_stage_gc_transaction(py)?;
+        Ok(true)
+    }
+
+    #[pyo3(signature = ())]
+    pub fn verify_gc_transaction(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let missing = blender::_verify_gc_transaction(py, self.sfm.clone(), self.gc_db.clone())?;
+        Ok(missing)
+    }
+
+    #[pyo3(signature = ())]
+    pub fn commit_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
+        blender::_commit_gc_transaction(py)?;
+        Ok(true)
+    }
+
+    #[pyo3(signature = ())]
+    pub fn revert_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
+        blender::_revert_gc_transaction(py)?;
+        Ok(true)
+    }
+
+    #[pyo3(signature = ())]
+    pub fn sweep_garbage(&self, py: Python<'_>) -> PyResult<bool> {
+        blender::_sweep_garbage(py)?;
+        Ok(true)
     }
 
     pub fn prune_shard(&self, shard_hash_hex: &str) -> PyResult<()> {
@@ -468,6 +572,322 @@ impl ShardIndex {
         let bytes = PyBytes::new(py, &output_buffer);
         Ok(bytes.into())
     }
+
+    #[pyo3(signature = (gc_db_path))]
+    pub fn init_gc(&self, gc_db_path: &str) -> PyResult<()> {
+        let db = redb::Database::create(gc_db_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to create GC DB: {e}")))?;
+        
+        let write_txn = db.begin_write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("GC DB Write txn failed: {e}")))?;
+        {
+            let _ = write_txn.open_table(GC_LIVE_CHUNKS_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open GC_LIVE_CHUNKS_TABLE: {e}")))?;
+            let _ = write_txn.open_table(GC_PRIMARY_XORB_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open GC_PRIMARY_XORB_TABLE: {e}")))?;
+            let _ = write_txn.open_table(GC_XORB_UTILIZATION_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open GC_XORB_UTILIZATION_TABLE: {e}")))?;
+        }
+        write_txn.commit()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("GC DB Commit failed: {e}")))?;
+
+        *self.gc_db.write().unwrap() = Some(db);
+        Ok(())
+    }
+
+    #[pyo3(signature = ())]
+    pub fn cleanup_gc(&self) -> PyResult<()> {
+        *self.gc_db.write().unwrap() = None;
+        Ok(())
+    }
+
+    #[pyo3(signature = (live_file_hashes))]
+    pub fn build_live_chunks_list(&self, py: Python<'_>, live_file_hashes: Vec<String>) -> PyResult<()> {
+        let gc_db_lock = self.gc_db.read().unwrap();
+        let gc_db = match &*gc_db_lock {
+            Some(db) => db,
+            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
+        };
+
+        // Insert live files into GC_LIVE_FILES_TABLE
+        let write_txn = gc_db.begin_write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+        {
+            let mut files_table = write_txn.open_table(GC_LIVE_FILES_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+            for file_hash_hex in &live_file_hashes {
+                if let Ok(h) = MerkleHash::from_hex(file_hash_hex) {
+                    let h_bytes: [u8; 32] = h.into();
+                    files_table.insert(&h_bytes, &())
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert failed: {e}")))?;
+                }
+            }
+        }
+        write_txn.commit()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+
+        for file_hash_hex in live_file_hashes {
+            let h = MerkleHash::from_hex(&file_hash_hex)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+
+            let res = self.rt.block_on(async {
+                self.sfm.get_file_reconstruction_info(&h).await
+            }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed for {}: {:?}", file_hash_hex, e)))?;
+
+            let (file_info, _) = match res {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let mut chunks_to_insert: Vec<([u8; 32], [u8; 32])> = Vec::new();
+
+            for segment in &file_info.segments {
+                let xorb_hash_hex = segment.xorb_hash.hex();
+                let layout_opt = self.get_xorb_layout(py, &xorb_hash_hex)?;
+                
+                if let Some(layout) = layout_opt {
+                    let layout_ref = layout.as_ref(py);
+                    let start_idx = segment.chunk_index_start as usize;
+                    let end_idx = segment.chunk_index_end as usize;
+
+                    for idx in start_idx..end_idx {
+                        if idx < layout_ref.len() {
+                            if let Ok(chunk_entry) = layout_ref.get_item(idx) {
+                                if let Ok(chunk_list) = chunk_entry.downcast::<PyList>() {
+                                    if let Ok(chunk_hash_str) = chunk_list.get_item(0).unwrap().extract::<String>() {
+                                        if let Ok(chunk_h) = MerkleHash::from_hex(&chunk_hash_str) {
+                                            chunks_to_insert.push((chunk_h.into(), segment.xorb_hash.into()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !chunks_to_insert.is_empty() {
+                let write_txn = gc_db.begin_write()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+                {
+                    let mut live_table = write_txn.open_table(GC_LIVE_CHUNKS_TABLE)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+                    let mut primary_table = write_txn.open_table(GC_PRIMARY_XORB_TABLE)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+
+                    for (chunk_h, xorb_h) in chunks_to_insert {
+                        live_table.insert(&chunk_h, &())
+                            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert failed: {e}")))?;
+                        
+                        if primary_table.get(&chunk_h).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?.is_none() {
+                            primary_table.insert(&chunk_h, &xorb_h)
+                                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert primary failed: {e}")))?;
+                        }
+                    }
+                }
+                write_txn.commit()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (chunk_hash_hex))]
+    pub fn is_chunk_live(&self, chunk_hash_hex: &str) -> PyResult<bool> {
+        let gc_db_lock = self.gc_db.read().unwrap();
+        let gc_db = match &*gc_db_lock {
+            Some(db) => db,
+            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
+        };
+
+        let h = MerkleHash::from_hex(chunk_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+        let h_bytes: [u8; 32] = h.into();
+
+        let read_txn = gc_db.begin_read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+        let table = read_txn.open_table(GC_LIVE_CHUNKS_TABLE)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+        
+        let res = table.get(&h_bytes)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+
+        Ok(res.is_some())
+    }
+
+    #[pyo3(signature = (chunk_hash_hex))]
+    pub fn get_primary_xorb(&self, chunk_hash_hex: &str) -> PyResult<Option<String>> {
+        let gc_db_lock = self.gc_db.read().unwrap();
+        let gc_db = match &*gc_db_lock {
+            Some(db) => db,
+            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
+        };
+
+        let h = MerkleHash::from_hex(chunk_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+        let h_bytes: [u8; 32] = h.into();
+
+        let read_txn = gc_db.begin_read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+        let table = read_txn.open_table(GC_PRIMARY_XORB_TABLE)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+        
+        let res = table.get(&h_bytes)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+
+        if let Some(xorb_hash_bytes) = res {
+            let xorb_hash = MerkleHash::from(*xorb_hash_bytes.value());
+            return Ok(Some(xorb_hash.hex()));
+        }
+        Ok(None)
+    }
+
+    #[pyo3(signature = (sparse_threshold=30.0))]
+    pub fn run_global_utilization_analysis(&self, py: Python<'_>, sparse_threshold: f64) -> PyResult<()> {
+        let gc_db_lock = self.gc_db.read().unwrap();
+        let gc_db = match &*gc_db_lock {
+            Some(db) => db,
+            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
+        };
+
+        let shards = self.rt.block_on(async {
+            self.sfm.registered_shard_list().await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
+
+        // Collect all XORBs and their layout
+        let mut xorb_layouts: std::collections::HashMap<MerkleHash, Vec<(MerkleHash, u32)>> = std::collections::HashMap::new();
+
+        for shard_file in shards {
+            let mut reader = match shard_file.get_reader() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            
+            let m_shard = match MDBMinimalShard::from_reader(&mut reader, false, true) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            
+            for i in 0..m_shard.num_xorb() {
+                if let Some(xiv) = m_shard.xorb(i) {
+                    let h = xiv.xorb_hash();
+                    if !xorb_layouts.contains_key(&h) {
+                        let mut layout = Vec::new();
+                        for j in 0..xiv.num_entries() {
+                            let chunk = xiv.chunk(j);
+                            layout.push((chunk.chunk_hash, chunk.unpacked_segment_bytes));
+                        }
+                        xorb_layouts.insert(h, layout);
+                    }
+                }
+            }
+        }
+
+        let write_txn = gc_db.begin_write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+        {
+            let mut util_table = write_txn.open_table(GC_XORB_UTILIZATION_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+            let mut sparse_table = write_txn.open_table(GC_SPARSE_XORBS_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Sparse table open failed: {e}")))?;
+            let live_chunks_table = write_txn.open_table(GC_LIVE_CHUNKS_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Live chunks table open failed: {e}")))?;
+
+            for (xorb_hash, chunks) in xorb_layouts {
+                let mut total_bytes = 0;
+                let mut live_bytes = 0;
+                let mut dead_chunks = Vec::new();
+
+                for (chunk_h, unpacked_bytes) in chunks {
+                    total_bytes += unpacked_bytes;
+                    
+                    let chunk_h_bytes: [u8; 32] = chunk_h.into();
+                    let is_live = live_chunks_table.get(&chunk_h_bytes)
+                        .unwrap_or(None)
+                        .is_some();
+                        
+                    if is_live {
+                        live_bytes += unpacked_bytes;
+                    } else {
+                        dead_chunks.push(chunk_h.hex());
+                    }
+                }
+
+                let utilization = if total_bytes == 0 { 0.0 } else { (live_bytes as f64 / total_bytes as f64) * 100.0 };
+                
+                // Construct a simple JSON string to save in redb
+                let dead_chunks_json = dead_chunks.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(",");
+                let json_str = format!("{{\"utilization\":{},\"live_bytes\":{},\"total_bytes\":{},\"dead_chunks\":[{}]}}",
+                    utilization, live_bytes, total_bytes, dead_chunks_json);
+                    
+                let xorb_h_bytes: [u8; 32] = xorb_hash.into();
+                util_table.insert(&xorb_h_bytes, json_str.as_str())
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert failed: {e}")))?;
+                    
+                if utilization <= sparse_threshold {
+                    sparse_table.insert(&xorb_h_bytes, ())
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert sparse failed: {e}")))?;
+                }
+            }
+        }
+        write_txn.commit()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+
+        Ok(())
+    }
+
+    #[pyo3(signature = (xorb_hash_hex))]
+    pub fn get_xorb_utilization(&self, xorb_hash_hex: &str) -> PyResult<Option<String>> {
+        let gc_db_lock = self.gc_db.read().unwrap();
+        let gc_db = match &*gc_db_lock {
+            Some(db) => db,
+            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
+        };
+
+        let h = MerkleHash::from_hex(xorb_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+        let h_bytes: [u8; 32] = h.into();
+
+        let read_txn = gc_db.begin_read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+        let table = match read_txn.open_table(GC_XORB_UTILIZATION_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
+        };
+        
+        let res = table.get(&h_bytes)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+
+        if let Some(value) = res {
+            let json_str = value.value().to_string();
+            return Ok(Some(json_str));
+        }
+        Ok(None)
+    }
+
+    #[pyo3(signature = ())]
+    pub fn get_sparse_xorbs(&self, _py: Python<'_>) -> PyResult<Vec<String>> {
+        let db_lock = self.gc_db.read().unwrap();
+        let db = match &*db_lock {
+            Some(d) => d,
+            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized")),
+        };
+
+        let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+        let table = match read_txn.open_table(GC_SPARSE_XORBS_TABLE) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut sparse_xorbs = Vec::new();
+        for item in table.iter().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table iter failed: {e}")))? {
+            let (key, _) = item.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table read failed: {e}")))?;
+            sparse_xorbs.push(MerkleHash::from(*key.value()).hex());
+        }
+
+        Ok(sparse_xorbs)
+    }
 }
 
 impl ShardIndex {
@@ -746,3 +1166,5 @@ fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reconstruct_shard, m)?)?;
     Ok(())
 }
+
+
