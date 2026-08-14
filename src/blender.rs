@@ -27,7 +27,7 @@ use mdb_shard::metadata_shard::shard_file_reconstructor::FileReconstructor;
 pub const TXN_META_TABLE: TableDefinition<&str, &str> = TableDefinition::new("txn_meta");
 pub const TXN_OLD_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_old_xorbs");
 pub const TXN_OLD_SHARDS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_old_shards");
-pub const TXN_NEW_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_new_xorbs");
+pub const TXN_NEW_XORBS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("txn_new_xorbs");
 pub const TXN_NEW_SHARDS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_new_shards");
 pub const TXN_CHUNK_MAP_TABLE: TableDefinition<&[u8; 32], &[u8; 36]> = TableDefinition::new("txn_chunk_map");
 pub const TXN_XORB_LAYOUT_TABLE: TableDefinition<&[u8; 36], &[u8; 32]> = TableDefinition::new("txn_xorb_layout");
@@ -64,7 +64,7 @@ pub fn _consolidate_metadata(
 
     // Bin-Packing State
     let max_xorb_size = 64 * 1024 * 1024; // 64 MB target
-    let mut all_new_xorb_infos: Vec<MDBXorbInfo> = Vec::new();
+    // Buffer State
 
     // Buffer State
     let mut xorb_new_chunks: Vec<u8> = Vec::new();
@@ -93,7 +93,7 @@ pub fn _consolidate_metadata(
     let sparse_xorbs = read_txn.open_table(GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
 
     // A closure to flush the current buffer to S3
-    let mut flush_xorb_buffer = |chunks: &mut Vec<u8>, entries: &mut Vec<XorbChunkSequenceEntry>, hashes: &mut Vec<MerkleHash>, offset: &mut u32, unp_size: &mut u32, map_table: &mut redb::Table<&[u8; 32], &[u8; 36]>, xorbs_table: &mut redb::Table<&str, ()>| -> PyResult<()> {
+    let mut flush_xorb_buffer = |chunks: &mut Vec<u8>, entries: &mut Vec<XorbChunkSequenceEntry>, hashes: &mut Vec<MerkleHash>, offset: &mut u32, unp_size: &mut u32, map_table: &mut redb::Table<&[u8; 32], &[u8; 36]>, xorbs_table: &mut redb::Table<&str, &[u8]>| -> PyResult<()> {
         if chunks.is_empty() { return Ok(()); }
         
         let mut xorb_new_full = Vec::new();
@@ -115,8 +115,10 @@ pub fn _consolidate_metadata(
             metadata: XorbChunkSequenceHeader::new(new_xorb_hash, entries.len() as u32, *offset),
             chunks: entries.clone(),
         };
-        all_new_xorb_infos.push(xorb_info);
-        xorbs_table.insert(new_xorb_hash_str.as_str(), ()).unwrap();
+        let mut serialized_bytes = Vec::new();
+        xorb_info.serialize(&mut serialized_bytes)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
+        xorbs_table.insert(new_xorb_hash_str.as_str(), serialized_bytes.as_slice()).unwrap();
 
         // Stream XORB natively
         rt.block_on(async {
@@ -190,10 +192,10 @@ pub fn _consolidate_metadata(
                 println!("GC DEBUG: Checking chunk {} in XORB {} -> is_live={}", h.hex(), xorb_hash_str, is_live);
                 
                 if is_live {
-                    let start = boundaries[i] as usize;
-                    let end = boundaries[i+1] as usize;
+                    let start = if i == 0 { 0 } else { boundaries[i - 1] as usize };
+                    let end = boundaries[i] as usize;
                     let len = (end - start) as u32;
-                    let unp_len = if i + 1 < unpacked.len() { unpacked[i+1] - unpacked[i] } else { len };
+                    let unp_len = if i == 0 { unpacked[0] } else { unpacked[i] - unpacked[i - 1] };
                     
                     xorb_new_chunks.extend_from_slice(&xorb_bytes[start..end]);
                     current_xorb_chunk_hashes.push(h);
@@ -212,8 +214,36 @@ pub fn _consolidate_metadata(
     // Flush any remaining partial XORB
     flush_xorb_buffer(&mut xorb_new_chunks, &mut new_entries, &mut current_xorb_chunk_hashes, &mut current_offset, &mut current_uncompressed_size, &mut chunk_map_table, &mut new_xorbs_table)?;
 
-    // 3. Process Old Shards Incrementally
-    let mut all_new_file_infos: Vec<MDBFileInfo> = Vec::new();
+    // 3. Process Old Shards Incrementally and Stream into New Shards
+    let mut current_shard = MDBInMemoryShard::default();
+    let mut added_xorbs: HashSet<MerkleHash> = HashSet::new();
+    let max_shard_size: u64 = 64 * 1024 * 1024; // 64 MB target
+    let mut unwritten_files = 0;
+
+    let mut flush_shard = |shard_mem: &mut MDBInMemoryShard, new_shards_table: &mut redb::Table<&str, ()>, added_xorbs: &mut HashSet<MerkleHash>| -> PyResult<()> {
+        let shard_bytes = shard_mem.to_bytes()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
+        
+        let new_shard_hash = compute_data_hash(&shard_bytes);
+        let new_shard_hash_str = new_shard_hash.hex();
+        
+        rt.block_on(async {
+            let key = format!("gc_consolidated/shards/{}.mdb", new_shard_hash_str);
+            client.put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(shard_bytes))
+                .send().await
+                .map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
+            Ok::<_, String>(())
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
+        
+        new_shards_table.insert(new_shard_hash_str.as_str(), ()).unwrap();
+        
+        *shard_mem = MDBInMemoryShard::default();
+        added_xorbs.clear();
+        Ok(())
+    };
     
     let shards = rt.block_on(async {
         sfm.registered_shard_list().await
@@ -306,7 +336,28 @@ pub fn _consolidate_metadata(
                             }
                         }
                         if valid {
-                            all_new_file_infos.push(file_info);
+                            for seg in &file_info.segments {
+                                if !added_xorbs.contains(&seg.xorb_hash) {
+                                    let x_str = seg.xorb_hash.hex();
+                                    if let Some(xorb_val) = new_xorbs_table.get(x_str.as_str()).unwrap() {
+                                        let bytes = xorb_val.value();
+                                        if let Ok(Some(xorb_info)) = MDBXorbInfo::deserialize(&mut std::io::Cursor::new(bytes)) {
+                                            current_shard.add_xorb_block(xorb_info)
+                                                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
+                                            added_xorbs.insert(seg.xorb_hash);
+                                        }
+                                    }
+                                }
+                            }
+
+                            current_shard.add_file_reconstruction_info(file_info)
+                                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
+                            unwritten_files += 1;
+                            
+                            if current_shard.shard_file_size() >= max_shard_size {
+                                flush_shard(&mut current_shard, &mut new_shards_table, &mut added_xorbs)?;
+                                unwritten_files = 0;
+                            }
                         }
                     }
                 }
@@ -314,59 +365,11 @@ pub fn _consolidate_metadata(
         }
     }
 
-    // 4. Assemble and Bin-Pack Shards
-    let mut flush_shard = |shard_mem: &mut MDBInMemoryShard, new_shards_table: &mut redb::Table<&str, ()>| -> PyResult<()> {
-        let shard_bytes = shard_mem.to_bytes()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
-        
-        let new_shard_hash = compute_data_hash(&shard_bytes);
-        let new_shard_hash_str = new_shard_hash.hex();
-        
-        rt.block_on(async {
-            let key = format!("gc_consolidated/shards/{}.mdb", new_shard_hash_str);
-            client.put_object()
-                .bucket(&bucket)
-                .key(&key)
-                .body(aws_sdk_s3::primitives::ByteStream::from(shard_bytes))
-                .send().await
-                .map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
-            Ok::<_, String>(())
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-        
-        new_shards_table.insert(new_shard_hash_str.as_str(), ()).unwrap();
-        
-        *shard_mem = MDBInMemoryShard::default();
-        Ok(())
-    };
-
-    let mut current_shard = MDBInMemoryShard::default();
-    
-    // Add all XORB infos first
-    for xorb_info in all_new_xorb_infos {
-        current_shard.add_xorb_block(xorb_info)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
-    }
-
-    // Add File infos incrementally
-    let max_shard_size: u64 = 64 * 1024 * 1024; // 64 MB target
-    let mut unwritten_files = 0;
-
-    for file_info in all_new_file_infos {
-        current_shard.add_file_reconstruction_info(file_info)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
-        unwritten_files += 1;
-        
-        if current_shard.shard_file_size() >= max_shard_size {
-            flush_shard(&mut current_shard, &mut new_shards_table)?;
-            unwritten_files = 0;
-        }
-    }
-    
     if unwritten_files > 0 || current_shard.num_xorb_entries() > 0 {
-        flush_shard(&mut current_shard, &mut new_shards_table)?;
+        flush_shard(&mut current_shard, &mut new_shards_table, &mut added_xorbs)?;
     }
     
-    // 5. Commit Transaction Lock
+    // 4. Update the active transaction metadata status to "consolidated"Lock
     drop(old_xorbs_table);
     drop(new_xorbs_table);
     drop(old_shards_table);
@@ -442,6 +445,7 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
         
         let new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let new_shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         
         rt.block_on(async {
             // Copy XORBs
@@ -461,6 +465,23 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
                 let dest = format!("shards/{}.mdb", hash);
                 client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await
                     .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))?;
+                
+                // Delete any existing tombstone for this new shard (resurrection)
+                let tombstone_key = format!("shards/tombstones/{}.revoked", hash);
+                let _ = client.delete_object().bucket(&bucket).key(&tombstone_key).send().await;
+            }
+            
+            // Tombstone old shards
+            for item in old_shards_table.iter().unwrap() {
+                let (hash_key, _) = item.unwrap();
+                let hash_str = hash_key.value();
+                let key = format!("shards/tombstones/{}.revoked", hash_str);
+                client.put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(Vec::new()))
+                    .send().await
+                    .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
             }
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -642,22 +663,7 @@ pub fn _commit_gc_transaction(_py: Python<'_>) -> PyResult<()> {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot commit: status is not staged or verified"));
         }
         
-        let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        
-        rt.block_on(async {
-            for item in old_shards_table.iter().unwrap() {
-                let (hash_key, _) = item.unwrap();
-                let hash_str = hash_key.value();
-                let key = format!("shards/tombstones/{}.revoked", hash_str);
-                client.put_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(Vec::new()))
-                    .send().await
-                    .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
-            }
-            Ok::<_, String>(())
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
+        // Tombstones for old_shards are already created during stage_gc, no need to create them here
         
         meta.insert("status", "committed").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     }
@@ -702,18 +708,27 @@ pub fn _revert_gc_transaction(_py: Python<'_>) -> PyResult<()> {
         }
         
         let new_shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         
         rt.block_on(async {
             for item in new_shards_table.iter().unwrap() {
                 let (hash_key, _) = item.unwrap();
                 let hash_str = hash_key.value();
-                let key = format!("shards/{}.mdb.revoked", hash_str);
+                let key = format!("shards/tombstones/{}.revoked", hash_str);
                 client.put_object()
                     .bucket(&bucket)
                     .key(&key)
                     .body(aws_sdk_s3::primitives::ByteStream::from(Vec::new()))
                     .send().await
                     .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
+            }
+            
+            // Delete tombstones for old shards (resurrection)
+            for item in old_shards_table.iter().unwrap() {
+                let (hash_key, _) = item.unwrap();
+                let hash_str = hash_key.value();
+                let key = format!("shards/tombstones/{}.revoked", hash_str);
+                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
             }
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -766,40 +781,93 @@ pub fn _sweep_garbage(_py: Python<'_>) -> PyResult<()> {
     };
     
     // We need to delete old_xorbs and old_shards if committed, OR new_xorbs and new_shards if reverted.
-    let xorbs_table = if is_commit { read_txn.open_table(TXN_OLD_XORBS_TABLE) } else { read_txn.open_table(TXN_NEW_XORBS_TABLE) }.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-    let shards_table = if is_commit { read_txn.open_table(TXN_OLD_SHARDS_TABLE) } else { read_txn.open_table(TXN_NEW_SHARDS_TABLE) }.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    let mut xorbs_to_delete: Vec<String> = Vec::new();
+    if is_commit {
+        let old_xorbs = read_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        for item in old_xorbs.iter().unwrap() { xorbs_to_delete.push(item.unwrap().0.value().to_string()); }
+    } else {
+        let new_xorbs = read_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        for item in new_xorbs.iter().unwrap() { xorbs_to_delete.push(item.unwrap().0.value().to_string()); }
+    }
+
+    let mut shards_to_delete: Vec<String> = Vec::new();
+    if is_commit {
+        let old_shards = read_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        for item in old_shards.iter().unwrap() { shards_to_delete.push(item.unwrap().0.value().to_string()); }
+    } else {
+        let new_shards = read_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        for item in new_shards.iter().unwrap() { shards_to_delete.push(item.unwrap().0.value().to_string()); }
+    }
+
+    let mut new_xorbs_to_delete: Vec<String> = Vec::new();
     let new_xorbs_table = read_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    for item in new_xorbs_table.iter().unwrap() { new_xorbs_to_delete.push(item.unwrap().0.value().to_string()); }
+
+    let mut new_shards_to_delete: Vec<String> = Vec::new();
     let new_shards_table = read_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    for item in new_shards_table.iter().unwrap() { new_shards_to_delete.push(item.unwrap().0.value().to_string()); }
     
     rt.block_on(async {
         // Delete XORBs
-        for item in xorbs_table.iter().unwrap() {
-            let (hash_key, _) = item.unwrap();
-            let key = format!("xorbs/default/{}", hash_key.value());
-            let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+        for hash_str in &xorbs_to_delete {
+            let key = format!("xorbs/default/{}", hash_str);
+            client.delete_object().bucket(&bucket).key(&key).send().await
+                .map_err(|e| format!("Failed to delete XORB {}: {:?}", key, e))?;
         }
         
         // Delete Shards (Leave tombstones so HydrationTask can discover them)
-        for item in shards_table.iter().unwrap() {
-            let (hash_key, _) = item.unwrap();
-            let key = format!("shards/{}.mdb", hash_key.value());
-            let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+        for hash_str in &shards_to_delete {
+            let key = format!("shards/{}.mdb", hash_str);
+            client.delete_object().bucket(&bucket).key(&key).send().await
+                .map_err(|e| format!("Failed to delete shard {}: {:?}", key, e))?;
         }
         
         // ALWAYS Delete Staging versions from gc_consolidated/
-        for item in new_xorbs_table.iter().unwrap() {
-            let (hash_key, _) = item.unwrap();
-            let key = format!("gc_consolidated/xorbs/{}", hash_key.value());
-            let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+        for hash_str in &new_xorbs_to_delete {
+            let key = format!("gc_consolidated/xorbs/{}", hash_str);
+            client.delete_object().bucket(&bucket).key(&key).send().await
+                .map_err(|e| format!("Failed to delete staging XORB {}: {:?}", key, e))?;
         }
-        for item in new_shards_table.iter().unwrap() {
-            let (hash_key, _) = item.unwrap();
-            let key = format!("gc_consolidated/shards/{}.mdb", hash_key.value());
-            let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+        for hash_str in &new_shards_to_delete {
+            let key = format!("gc_consolidated/shards/{}.mdb", hash_str);
+            client.delete_object().bucket(&bucket).key(&key).send().await
+                .map_err(|e| format!("Failed to delete staging shard {}: {:?}", key, e))?;
         }
         
         // Finally, delete the lock file itself
-        let _ = client.delete_object().bucket(&bucket).key("gc/active_transaction.redb").send().await;
+        client.delete_object().bucket(&bucket).key("gc/active_transaction.redb").send().await
+            .map_err(|e| format!("Failed to delete transaction lock: {:?}", e))?;
+        
+        // As a final cleanup step, delete any tombstones older than 7 days
+        let mut continuation_token = None;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let seven_days = 7 * 24 * 60 * 60;
+        
+        loop {
+            let mut req = client.list_objects_v2().bucket(&bucket).prefix("shards/tombstones/");
+            if let Some(token) = continuation_token {
+                req = req.continuation_token(token);
+            }
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(_) => break, // If listing fails, we just skip tombstone cleanup for this run
+            };
+            
+            for obj in resp.contents() {
+                if let Some(last_modified) = obj.last_modified() {
+                    if now - last_modified.secs() > seven_days {
+                        if let Some(key) = obj.key() {
+                            let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+                        }
+                    }
+                }
+            }
+            
+            continuation_token = resp.next_continuation_token().map(String::from);
+            if continuation_token.is_none() {
+                break;
+            }
+        }
         
         Ok::<_, String>(())
     }).unwrap();

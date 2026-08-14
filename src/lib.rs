@@ -451,8 +451,10 @@ impl ShardIndex {
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
 
         for shard_file in shards {
-            let mut reader = shard_file.get_reader()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open shard reader: {e:?}")))?;
+            let mut reader = match shard_file.get_reader() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             
             let mut dest_indices = [0u32; 8];
             if let Ok(num_indices) = shard_file.shard.get_xorb_info_index_by_hash(&mut reader, &h, &mut dest_indices) {
@@ -773,9 +775,22 @@ impl ShardIndex {
                     let h = xiv.xorb_hash();
                     if !xorb_layouts.contains_key(&h) {
                         let mut layout = Vec::new();
-                        for j in 0..xiv.num_entries() {
+                        let num_entries = xiv.num_entries();
+                        for j in 0..num_entries {
                             let chunk = xiv.chunk(j);
-                            layout.push((chunk.chunk_hash, chunk.unpacked_segment_bytes));
+                            
+                            // Calculate exact physical packed length using boundaries
+                            let packed_length = if j + 1 < num_entries {
+                                let next_chunk = xiv.chunk(j + 1);
+                                next_chunk.chunk_byte_range_start.saturating_sub(chunk.chunk_byte_range_start)
+                            } else {
+                                // Fundamental limitation of the Shard Index: The physical size of the final 
+                                // chunk is never stored. We must use `unpacked_segment_bytes` as the safe 
+                                // upper-bound estimate, which is identical to how xet-core internally fakes it.
+                                chunk.unpacked_segment_bytes
+                            };
+                            
+                            layout.push((chunk.chunk_hash, packed_length));
                         }
                         xorb_layouts.insert(h, layout);
                     }
@@ -794,12 +809,13 @@ impl ShardIndex {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Live chunks table open failed: {e}")))?;
 
             for (xorb_hash, chunks) in xorb_layouts {
-                let mut total_bytes = 0;
-                let mut live_bytes = 0;
+                let mut total_bytes: u64 = 0;
+                let mut live_bytes: u64 = 0;
                 let mut dead_chunks = Vec::new();
 
-                for (chunk_h, unpacked_bytes) in chunks {
-                    total_bytes += unpacked_bytes;
+                for (chunk_h, packed_bytes) in chunks {
+                    let packed_bytes_u64 = packed_bytes as u64;
+                    total_bytes += packed_bytes_u64;
                     
                     let chunk_h_bytes: [u8; 32] = chunk_h.into();
                     let is_live = live_chunks_table.get(&chunk_h_bytes)
@@ -807,7 +823,7 @@ impl ShardIndex {
                         .is_some();
                         
                     if is_live {
-                        live_bytes += unpacked_bytes;
+                        live_bytes += packed_bytes_u64;
                     } else {
                         dead_chunks.push(chunk_h.hex());
                     }
