@@ -443,8 +443,8 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot stage: status is missing"));
         }
         let status_val = status.unwrap().value().to_string();
-        if status_val != "consolidated" && status_val != "verified" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot stage: status must be consolidated or verified"));
+        if status_val != "consolidated" && status_val != "verified" && status_val != "verification_failed" && status_val != "failed" {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot stage: status must be consolidated, verified, verification_failed, or failed"));
         }
         
         let new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
@@ -911,40 +911,64 @@ pub fn _sweep_garbage(_py: Python<'_>) -> PyResult<()> {
     let new_shards_table = read_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     for item in new_shards_table.iter().unwrap() { new_shards_to_delete.push(item.unwrap().0.value().to_string()); }
     
+    // Explicitly drop the database to release the file lock and save memory before long S3 operations
+    drop(db);
+    
     rt.block_on(async {
-        // Delete XORBs
+        // Recycle Bin XORBs
         for hash_str in &xorbs_to_delete {
             let key = format!("xorbs/default/{}", hash_str);
-            client.delete_object().bucket(&bucket).key(&key).send().await
-                .map_err(|e| format!("Failed to delete XORB {}: {:?}", key, e))?;
+            let dest = format!("gc_sweep/{}", key);
+            let src = format!("{}/{}", bucket, key);
+            if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+            }
         }
         
-        // Delete Shards (Leave tombstones so HydrationTask can discover them)
+        // Recycle Bin Shards
         for hash_str in &shards_to_delete {
             let key = format!("shards/{}.mdb", hash_str);
-            client.delete_object().bucket(&bucket).key(&key).send().await
-                .map_err(|e| format!("Failed to delete shard {}: {:?}", key, e))?;
+            let dest = format!("gc_sweep/{}", key);
+            let src = format!("{}/{}", bucket, key);
+            if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+            }
         }
         
         // ALWAYS Delete Staging versions from gc_consolidated/
         for hash_str in &new_xorbs_to_delete {
             let key = format!("gc_consolidated/xorbs/{}", hash_str);
-            client.delete_object().bucket(&bucket).key(&key).send().await
-                .map_err(|e| format!("Failed to delete staging XORB {}: {:?}", key, e))?;
+            let dest = format!("gc_sweep/{}", key);
+            let src = format!("{}/{}", bucket, key);
+            if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+            }
         }
         for hash_str in &new_shards_to_delete {
             let key = format!("gc_consolidated/shards/{}.mdb", hash_str);
-            client.delete_object().bucket(&bucket).key(&key).send().await
-                .map_err(|e| format!("Failed to delete staging shard {}: {:?}", key, e))?;
+            let dest = format!("gc_sweep/{}", key);
+            let src = format!("{}/{}", bucket, key);
+            if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+            }
         }
         
-        // Finally, delete the lock file itself
-        client.delete_object().bucket(&bucket).key("gc/active_transaction.redb").send().await
-            .map_err(|e| format!("Failed to delete transaction lock: {:?}", e))?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        
+        // Finally, move the transaction lock file itself to the recycle bin (with timestamp so we have an audit log!)
+        let lock_key = "gc/active_transaction.redb";
+        let dest_lock = format!("gc_sweep/gc/active_transaction_{}.redb", now);
+        let src_lock = format!("{}/{}", bucket, lock_key);
+        
+        if let Ok(_) = client.copy_object().copy_source(&src_lock).bucket(&bucket).key(&dest_lock).send().await {
+            let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
+        } else {
+            // Fallback to just deleting if copy fails for some reason
+            let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
+        }
         
         // As a final cleanup step, delete any tombstones older than 7 days
         let mut continuation_token = None;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         let seven_days = 7 * 24 * 60 * 60;
         
         loop {
@@ -961,6 +985,18 @@ pub fn _sweep_garbage(_py: Python<'_>) -> PyResult<()> {
                 if let Some(last_modified) = obj.last_modified() {
                     if now - last_modified.secs() > seven_days {
                         if let Some(key) = obj.key() {
+                            // key is something like "shards/tombstones/12345.revoked"
+                            if key.ends_with(".revoked") {
+                                let file_name = key.split('/').last().unwrap(); // "12345.revoked"
+                                let hash_str = file_name.strip_suffix(".revoked").unwrap(); // "12345"
+                                
+                                let shard_key = format!("shards/{}.mdb", hash_str);
+                                
+                                // Permanently delete the orphaned shard
+                                let _ = client.delete_object().bucket(&bucket).key(&shard_key).send().await;
+                            }
+                            
+                            // Delete the tombstone itself
                             let _ = client.delete_object().bucket(&bucket).key(key).send().await;
                         }
                     }
@@ -976,9 +1012,119 @@ pub fn _sweep_garbage(_py: Python<'_>) -> PyResult<()> {
         Ok::<_, String>(())
     }).unwrap();
     
-    drop(db);
     let _ = std::fs::remove_file(txn_path);
     Ok(())
 }
 
+pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
+    let rt = Runtime::new().unwrap();
+    let (client, bucket) = _setup_s3_client()?;
+    let txn_path = format!("/tmp/active_transaction_explore_{}.redb", std::process::id());
+    
+    rt.block_on(async {
+        let key = "gc/active_transaction.redb";
+        let resp = client.get_object().bucket(&bucket).key(key).send().await
+            .map_err(|e| format!("Failed to get lock: {:?}", e))?;
+        let data = resp.body.collect().await.map_err(|e| format!("Failed to read lock: {:?}", e))?;
+        std::fs::write(&txn_path, data.into_bytes()).map_err(|e| format!("Failed to save lock: {}", e))?;
+        Ok::<_, String>(())
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
+    
+    let db = Database::create(&txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
+    let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn err: {e}")))?;
+    
+    let dict = pyo3::types::PyDict::new(py);
+    
+    if let Ok(meta_table) = read_txn.open_table(TXN_META_TABLE) {
+        if let Ok(Some(status)) = meta_table.get("status") {
+            dict.set_item("status", status.value())?;
+        }
+        if let Ok(Some(timestamp)) = meta_table.get("timestamp") {
+            dict.set_item("timestamp", timestamp.value())?;
+        }
+    }
+    
+    let new_shards = pyo3::types::PyList::empty(py);
+    if let Ok(table) = read_txn.open_table(TXN_NEW_SHARDS_TABLE) {
+        if let Ok(iter) = table.iter() {
+            for item in iter {
+                let (k, _) = item.unwrap();
+                new_shards.append(k.value())?;
+            }
+        }
+    }
+    dict.set_item("new_shards", new_shards)?;
 
+    let old_shards = pyo3::types::PyList::empty(py);
+    if let Ok(table) = read_txn.open_table(TXN_OLD_SHARDS_TABLE) {
+        if let Ok(iter) = table.iter() {
+            for item in iter {
+                let (k, _) = item.unwrap();
+                old_shards.append(k.value())?;
+            }
+        }
+    }
+    dict.set_item("old_shards", old_shards)?;
+
+    let new_xorbs = pyo3::types::PyList::empty(py);
+    if let Ok(table) = read_txn.open_table(TXN_NEW_XORBS_TABLE) {
+        if let Ok(iter) = table.iter() {
+            for item in iter {
+                let (k, _) = item.unwrap();
+                new_xorbs.append(k.value())?;
+            }
+        }
+    }
+    dict.set_item("new_xorbs", new_xorbs)?;
+
+    let old_xorbs = pyo3::types::PyList::empty(py);
+    if let Ok(table) = read_txn.open_table(TXN_OLD_XORBS_TABLE) {
+        if let Ok(iter) = table.iter() {
+            for item in iter {
+                let (k, _) = item.unwrap();
+                old_xorbs.append(k.value())?;
+            }
+        }
+    }
+    dict.set_item("old_xorbs", old_xorbs)?;
+
+    drop(read_txn);
+    drop(db);
+    let _ = std::fs::remove_file(&txn_path);
+
+    Ok(dict.into())
+}
+
+pub fn _purge_garbage(_py: Python<'_>) -> PyResult<()> {
+    let rt = Runtime::new().unwrap();
+    let (client, bucket) = _setup_s3_client()?;
+    
+    rt.block_on(async {
+        let mut continuation_token = None;
+        loop {
+            let mut req = client.list_objects_v2().bucket(&bucket).prefix("gc_sweep/");
+            if let Some(token) = continuation_token {
+                req = req.continuation_token(token);
+            }
+            let resp = req.send().await;
+            
+            if let Ok(resp) = resp {
+                for object in resp.contents() {
+                    if let Some(key) = object.key() {
+                        let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+                    }
+                }
+                if resp.is_truncated() == Some(true) {
+                    continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok::<_, String>(())
+    }).unwrap();
+    
+    Ok(())
+}

@@ -1174,13 +1174,23 @@ pub fn reconstruct_shard(py: Python<'_>, shard_bytes: &[u8]) -> PyResult<PyObjec
     }
 }
 
+#[pyfunction]
+pub fn get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    blender::_get_gc_transaction_info(py)
+}
+
+#[pyfunction]
+fn purge_garbage(py: Python<'_>) -> PyResult<()> {
+    blender::_purge_garbage(py)
+}
+
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ShardIndex>()?;
     m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
     m.add_function(wrap_pyfunction!(add_footer_to_xorb, m)?)?;
     m.add_function(wrap_pyfunction!(reconstruct_shard, m)?)?;
+    m.add_function(wrap_pyfunction!(get_gc_transaction_info, m)?)?;
+    m.add_function(wrap_pyfunction!(purge_garbage, m)?)?;
     Ok(())
 }
-
-
