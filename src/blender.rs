@@ -439,8 +439,12 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
     {
         let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let status = meta.get("status").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        if status.is_none() || status.unwrap().value() != "consolidated" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot stage: status is not consolidated"));
+        if status.is_none() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot stage: status is missing"));
+        }
+        let status_val = status.unwrap().value().to_string();
+        if status_val != "consolidated" && status_val != "verified" {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot stage: status must be consolidated or verified"));
         }
         
         let new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
@@ -537,83 +541,180 @@ pub fn _verify_gc_transaction(
     }
     
     // Integrity Verification (Pass 1 and 2)
+    // Extract new shards and old XORBs into memory
+    let mut new_shards = Vec::new();
+    let mut old_xorbs = std::collections::HashSet::new();
+    let mut old_shards = std::collections::HashSet::new();
+    
+    if let Ok(shards_table) = write_txn.open_table(TXN_NEW_SHARDS_TABLE) {
+        for item in shards_table.iter().unwrap() {
+            let (hash_key, _) = item.unwrap();
+            new_shards.push(hash_key.value().to_string());
+        }
+    }
+    if let Ok(xorbs_table) = write_txn.open_table(TXN_OLD_XORBS_TABLE) {
+        for item in xorbs_table.iter().unwrap() {
+            let (hash_key, _) = item.unwrap();
+            old_xorbs.insert(hash_key.value().to_string());
+        }
+    }
+    if let Ok(old_shards_table) = write_txn.open_table(TXN_OLD_SHARDS_TABLE) {
+        for item in old_shards_table.iter().unwrap() {
+            let (hash_key, _) = item.unwrap();
+            let hash_hex = hash_key.value().to_string();
+            old_shards.insert(hash_hex.clone());
+            
+            // Prune old shards from sfm so it is forced to use surviving shards
+            let shard_path = sfm.shard_directory().join(format!("{}.mdb", hash_hex));
+            let _ = std::fs::remove_file(shard_path);
+        }
+        let _ = rt.block_on(async { sfm.refresh_shard_dir(false, 0).await });
+    }
+    
+    // 1. Build Future State map from staging shards
+    let mut new_file_deps = std::collections::HashMap::new();
+    rt.block_on(async {
+        for shard_hash in &new_shards {
+            let key = format!("gc_consolidated/shards/{}.mdb", shard_hash);
+            let resp = client.get_object().bucket(&bucket).key(&key).send().await;
+            if let Ok(r) = resp {
+                if let Ok(data) = r.body.collect().await {
+                    let bytes = data.into_bytes();
+                    if let Ok(minimal_shard) = MDBMinimalShard::from_reader(&mut std::io::Cursor::new(&bytes), true, true) {
+                        for i in 0..minimal_shard.num_files() {
+                            if let Some(file_view) = minimal_shard.file(i) {
+                                let mut deps = Vec::new();
+                                for seg in 0..file_view.num_entries() {
+                                    let segment = file_view.entry(seg);
+                                    deps.push(segment.xorb_hash.hex());
+                                }
+                                new_file_deps.insert(file_view.file_hash().hex(), deps);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 2. Gather unique XORB dependencies for all live files (Pass 1)
+    let mut unique_s3_xorbs = std::collections::HashSet::new();
     let mut missing_files = Vec::new();
+    
     let gc_db_lock = gc_db.read().unwrap();
     if let Some(ref gcdb) = *gc_db_lock {
         let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
         if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
-            
-            // 1. Gather all file dependencies
-            let mut file_dependencies = std::collections::HashMap::new();
-            let mut unique_xorbs = std::collections::HashSet::new();
-            
             for item in files_table.iter().unwrap() {
                 let (file_hash_bytes, _) = item.unwrap();
-                let file_hash_val = file_hash_bytes.value();
                 let mut h = [0u8; 32];
-                h.copy_from_slice(file_hash_val);
-                let file_hash = MerkleHash::from(h);
-                let file_hash_hex = file_hash.hex();
+                h.copy_from_slice(file_hash_bytes.value());
+                let file_hash_hex = MerkleHash::from(h).hex();
                 
-                let res = rt.block_on(async { sfm.get_file_reconstruction_info(&file_hash).await });
-                match res {
-                    Ok(Some((info, _))) => {
-                        let mut xorb_deps = Vec::new();
-                        for segment in info.segments {
-                            let xh = segment.xorb_hash.hex();
-                            unique_xorbs.insert(xh.clone());
-                            xorb_deps.push(xh);
+                let mut xorb_deps = Vec::new();
+                let mut found = true;
+                
+                if let Some(deps) = new_file_deps.get(&file_hash_hex) {
+                    xorb_deps = deps.clone();
+                } else {
+                    // Untouched file -> safely check SFM
+                    let res = rt.block_on(async { sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                    match res {
+                        Ok(Some((info, _))) => {
+                            for segment in info.segments {
+                                xorb_deps.push(segment.xorb_hash.hex());
+                            }
+                        },
+                        _ => {
+                            found = false;
                         }
-                        file_dependencies.insert(file_hash_hex, xorb_deps);
-                    },
-                    _ => {
+                    }
+                }
+                
+                if !found {
+                    missing_files.push(file_hash_hex.clone());
+                    continue;
+                }
+                
+                // Validate XORBs
+                for xh in &xorb_deps {
+                    if old_xorbs.contains(xh) {
+                        // Dangling pointer to deleted tombstone!
+                        missing_files.push(file_hash_hex.clone());
+                        break;
+                    }
+                    unique_s3_xorbs.insert(xh.clone());
+                }
+            }
+        }
+    }
+    
+    // 3. Concurrently verify all required XORBs actually exist physically
+    use futures::stream::{StreamExt, iter};
+    let mut missing_xorbs = std::collections::HashSet::new();
+    
+    let verification_results = rt.block_on(async {
+        let futures_iter = unique_s3_xorbs.into_iter().map(|xorb_hash_hex| {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            async move {
+                let key_staged = format!("gc_consolidated/xorbs/{}", xorb_hash_hex);
+                let key_live = format!("xorbs/default/{}", xorb_hash_hex);
+                
+                // Check staged first (faster since GC just put them there)
+                if client.head_object().bucket(&bucket).key(&key_staged).send().await.is_ok() {
+                    return (xorb_hash_hex, true);
+                }
+                if client.head_object().bucket(&bucket).key(&key_live).send().await.is_ok() {
+                    return (xorb_hash_hex, true);
+                }
+                (xorb_hash_hex, false)
+            }
+        });
+        
+        iter(futures_iter)
+            .buffer_unordered(100)
+            .collect::<Vec<(String, bool)>>()
+            .await
+    });
+    
+    for (xh, exists) in verification_results {
+        if !exists {
+            missing_xorbs.insert(xh);
+        }
+    }
+    
+    // 4. Second pass to stream files and check for missing XORB intersections
+    if !missing_xorbs.is_empty() {
+        if let Some(ref gcdb) = *gc_db_lock {
+            let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
+            if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
+                for item in files_table.iter().unwrap() {
+                    let (file_hash_bytes, _) = item.unwrap();
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(file_hash_bytes.value());
+                    let file_hash_hex = MerkleHash::from(h).hex();
+                    
+                    if missing_files.contains(&file_hash_hex) {
+                        continue;
+                    }
+                    
+                    let mut xorb_deps = Vec::new();
+                    if let Some(deps) = new_file_deps.get(&file_hash_hex) {
+                        xorb_deps = deps.clone();
+                    } else {
+                        // Untouched file -> safely check SFM
+                        let res = rt.block_on(async { sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                        if let Ok(Some((info, _))) = res {
+                            for segment in info.segments {
+                                xorb_deps.push(segment.xorb_hash.hex());
+                            }
+                        }
+                    }
+                    
+                    if xorb_deps.iter().any(|xh| missing_xorbs.contains(xh)) {
                         missing_files.push(file_hash_hex);
                     }
-                }
-            }
-            
-            // 2. Concurrently verify all unique XORBs
-            use futures::stream::{StreamExt, iter};
-            let mut missing_xorbs = std::collections::HashSet::new();
-            
-            let verification_results = rt.block_on(async {
-                let futures_iter = unique_xorbs.into_iter().map(|xorb_hash_hex| {
-                    let client = client.clone();
-                    let bucket = bucket.clone();
-                    async move {
-                        let key_live = format!("xorbs/default/{}", xorb_hash_hex);
-                        let key_staged = format!("gc_consolidated/xorbs/{}", xorb_hash_hex);
-                        
-                        let s3_res_live = client.head_object().bucket(&bucket).key(&key_live).send().await;
-                        if s3_res_live.is_ok() {
-                            return (xorb_hash_hex, true);
-                        }
-                        
-                        let s3_res_staged = client.head_object().bucket(&bucket).key(&key_staged).send().await;
-                        if s3_res_staged.is_ok() {
-                            return (xorb_hash_hex, true);
-                        }
-                        
-                        (xorb_hash_hex, false)
-                    }
-                });
-                
-                iter(futures_iter)
-                    .buffer_unordered(100)
-                    .collect::<Vec<(String, bool)>>()
-                    .await
-            });
-            
-            for (xh, exists) in verification_results {
-                if !exists {
-                    missing_xorbs.insert(xh);
-                }
-            }
-            
-            // 3. Mark files missing if they depend on missing XORBs
-            for (file_hash_hex, xorb_deps) in file_dependencies {
-                if xorb_deps.iter().any(|xh| missing_xorbs.contains(xh)) {
-                    missing_files.push(file_hash_hex);
                 }
             }
         }
@@ -622,6 +723,9 @@ pub fn _verify_gc_transaction(
     if missing_files.is_empty() {
         let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         meta.insert("status", "verified").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    } else {
+        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        meta.insert("status", "failed").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     }
 
     write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit err: {e}")))?;
