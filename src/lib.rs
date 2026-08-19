@@ -1158,6 +1158,11 @@ fn bytes_to_in_memory_shard(shard_bytes: &[u8]) -> PyResult<mdb_shard::metadata_
 }
 
 #[pyfunction]
+pub fn compute_shard_hash(shard_bytes: &[u8]) -> String {
+    compute_data_hash(shard_bytes).hex()
+}
+
+#[pyfunction]
 pub fn reconstruct_shard(py: Python<'_>, shard_bytes: &[u8]) -> PyResult<PyObject> {
     let header = MDBShardFileHeader::deserialize(&mut Cursor::new(shard_bytes))
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse header: {e:?}")))?;
@@ -1187,6 +1192,7 @@ fn purge_garbage(py: Python<'_>) -> PyResult<()> {
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ShardIndex>()?;
+    m.add_function(wrap_pyfunction!(compute_shard_hash, m)?)?;
     m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
     m.add_function(wrap_pyfunction!(add_footer_to_xorb, m)?)?;
     m.add_function(wrap_pyfunction!(reconstruct_shard, m)?)?;
@@ -1194,3 +1200,4 @@ fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(purge_garbage, m)?)?;
     Ok(())
 }
+
