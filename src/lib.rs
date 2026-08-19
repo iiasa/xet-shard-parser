@@ -113,6 +113,22 @@ impl ShardIndex {
         Ok(dict.into())
     }
 
+    #[pyo3(signature = (file_hash_hex))]
+    pub fn get_file_size(&self, py: Python<'_>, file_hash_hex: &str) -> PyResult<Option<u64>> {
+        let h = MerkleHash::from_hex(file_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+        
+        let res = self.rt.block_on(async {
+            self.sfm.get_file_reconstruction_info(&h).await
+        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed: {e:?}")))?;
+        
+        if let Some((file_info, _)) = res {
+            Ok(Some(file_info.file_size() as u64))
+        } else {
+            Ok(None)
+        }
+    }
+
     #[pyo3(signature = (xorb_hashes))]
     pub fn get_shards_for_xorbs(&self, py: Python<'_>, xorb_hashes: Vec<String>) -> PyResult<std::collections::HashSet<String>> {
         let mut target_xorbs: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
