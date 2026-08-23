@@ -200,7 +200,7 @@ impl ShardIndex {
     }
 
     #[pyo3(signature = ())]
-    pub fn verify_gc_transaction(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+    pub fn verify_gc_transaction(&self, py: Python<'_>) -> PyResult<usize> {
         let missing = blender::_verify_gc_transaction(py, self.sfm.clone(), self.gc_db.clone())?;
         Ok(missing)
     }
@@ -218,8 +218,8 @@ impl ShardIndex {
     }
 
     #[pyo3(signature = ())]
-    pub fn sweep_garbage(&self, py: Python<'_>) -> PyResult<bool> {
-        blender::_sweep_garbage(py)?;
+    pub fn prune_garbage(&self, py: Python<'_>) -> PyResult<bool> {
+        blender::_prune_garbage(py)?;
         Ok(true)
     }
 
@@ -1200,11 +1200,6 @@ pub fn get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     blender::_get_gc_transaction_info(py)
 }
 
-#[pyfunction]
-fn purge_garbage(py: Python<'_>) -> PyResult<()> {
-    blender::_purge_garbage(py)
-}
-
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ShardIndex>()?;
@@ -1213,7 +1208,7 @@ fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(add_footer_to_xorb, m)?)?;
     m.add_function(wrap_pyfunction!(reconstruct_shard, m)?)?;
     m.add_function(wrap_pyfunction!(get_gc_transaction_info, m)?)?;
-    m.add_function(wrap_pyfunction!(purge_garbage, m)?)?;
+
     Ok(())
 }
 

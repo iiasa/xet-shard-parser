@@ -31,6 +31,7 @@ pub const TXN_NEW_XORBS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::n
 pub const TXN_NEW_SHARDS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_new_shards");
 pub const TXN_CHUNK_MAP_TABLE: TableDefinition<&[u8; 32], &[u8; 36]> = TableDefinition::new("txn_chunk_map");
 pub const TXN_XORB_LAYOUT_TABLE: TableDefinition<&[u8; 36], &[u8; 32]> = TableDefinition::new("txn_xorb_layout");
+pub const TXN_MISSING_FILES_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_missing_files");
 
 fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
     let mut reader = Cursor::new(bytes);
@@ -450,6 +451,7 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
         let new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let new_shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        let old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         
         rt.block_on(async {
             // Copy XORBs
@@ -475,10 +477,25 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
                 let _ = client.delete_object().bucket(&bucket).key(&tombstone_key).send().await;
             }
             
-            // Tombstone old shards
+            // Tombstone and move old shards
             for item in old_shards_table.iter().unwrap() {
                 let (hash_key, _) = item.unwrap();
                 let hash_str = hash_key.value();
+                
+                // Move old shard to bin
+                let src = format!("{}/shards/{}.mdb", bucket, hash_str);
+                let dest = format!("bin/shards/{}.mdb", hash_str);
+                if let Err(e) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                    // Ignore 404s if it was already moved
+                    if !format!("{:?}", e).contains("NotFound") && !format!("{:?}", e).contains("NoSuchKey") {
+                        return Err(format!("Copy failed for {}: {:?}", hash_str, e));
+                    }
+                } else {
+                    let key_to_del = format!("shards/{}.mdb", hash_str);
+                    let _ = client.delete_object().bucket(&bucket).key(&key_to_del).send().await;
+                }
+
+                // Create tombstone
                 let key = format!("shards/tombstones/{}.revoked", hash_str);
                 client.put_object()
                     .bucket(&bucket)
@@ -486,6 +503,23 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
                     .body(aws_sdk_s3::primitives::ByteStream::from(Vec::new()))
                     .send().await
                     .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
+            }
+            
+            // Move old XORBs
+            for item in old_xorbs_table.iter().unwrap() {
+                let (hash_key, _) = item.unwrap();
+                let hash_str = hash_key.value();
+                
+                let src = format!("{}/xorbs/default/{}", bucket, hash_str);
+                let dest = format!("bin/xorbs/{}", hash_str);
+                if let Err(e) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                    if !format!("{:?}", e).contains("NotFound") && !format!("{:?}", e).contains("NoSuchKey") {
+                        return Err(format!("Copy failed for {}: {:?}", hash_str, e));
+                    }
+                } else {
+                    let key_to_del = format!("xorbs/default/{}", hash_str);
+                    let _ = client.delete_object().bucket(&bucket).key(&key_to_del).send().await;
+                }
             }
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -511,7 +545,7 @@ pub fn _verify_gc_transaction(
     _py: Python<'_>,
     sfm: Arc<ShardFileManager>,
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
-) -> PyResult<Vec<String>> {
+) -> PyResult<usize> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = _setup_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
@@ -599,7 +633,9 @@ pub fn _verify_gc_transaction(
 
     // 2. Gather unique XORB dependencies for all live files (Pass 1)
     let mut unique_s3_xorbs = std::collections::HashSet::new();
-    let mut missing_files = Vec::new();
+    let mut missing_count = 0;
+    
+    let mut missing_table = write_txn.open_table(TXN_MISSING_FILES_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
     let gc_db_lock = gc_db.read().unwrap();
     if let Some(ref gcdb) = *gc_db_lock {
@@ -632,7 +668,8 @@ pub fn _verify_gc_transaction(
                 }
                 
                 if !found {
-                    missing_files.push(file_hash_hex.clone());
+                    missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+                    missing_count += 1;
                     continue;
                 }
                 
@@ -640,7 +677,8 @@ pub fn _verify_gc_transaction(
                 for xh in &xorb_deps {
                     if old_xorbs.contains(xh) {
                         // Dangling pointer to deleted tombstone!
-                        missing_files.push(file_hash_hex.clone());
+                        missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+                        missing_count += 1;
                         break;
                     }
                     unique_s3_xorbs.insert(xh.clone());
@@ -695,7 +733,7 @@ pub fn _verify_gc_transaction(
                     h.copy_from_slice(file_hash_bytes.value());
                     let file_hash_hex = MerkleHash::from(h).hex();
                     
-                    if missing_files.contains(&file_hash_hex) {
+                    if missing_table.get(file_hash_hex.as_str()).unwrap().is_some() {
                         continue;
                     }
                     
@@ -711,22 +749,24 @@ pub fn _verify_gc_transaction(
                             }
                         }
                     }
-                    
                     if xorb_deps.iter().any(|xh| missing_xorbs.contains(xh)) {
-                        missing_files.push(file_hash_hex);
+                        missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+                        missing_count += 1;
                     }
                 }
             }
         }
     }
 
-    if missing_files.is_empty() {
+    if missing_count == 0 {
         let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         meta.insert("status", "verified").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     } else {
         let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         meta.insert("status", "failed").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     }
+    
+    drop(missing_table);
 
     write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit err: {e}")))?;
     drop(db);
@@ -739,7 +779,7 @@ pub fn _verify_gc_transaction(
     }).unwrap();
     
     let _ = std::fs::remove_file(txn_path);
-    Ok(missing_files)
+    Ok(missing_count)
 }
 
 pub fn _commit_gc_transaction(_py: Python<'_>) -> PyResult<()> {
@@ -807,17 +847,25 @@ pub fn _revert_gc_transaction(_py: Python<'_>) -> PyResult<()> {
         let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let status = meta.get("status").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let status_val = status.map(|s| s.value().to_string()).unwrap_or_default();
-        if status_val != "consolidated" && status_val != "staged" && status_val != "verified" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot revert: status is not consolidated, staged or verified"));
+        if status_val == "consolidated" {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot revert: transaction has not been staged yet. Nothing to revert."));
+        } else if status_val != "staged" && status_val != "verified" {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot revert: status is not staged or verified"));
         }
         
         let new_shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        let new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        let old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         
         rt.block_on(async {
             for item in new_shards_table.iter().unwrap() {
                 let (hash_key, _) = item.unwrap();
                 let hash_str = hash_key.value();
+                
+                let active_key = format!("shards/{}.mdb", hash_str);
+                let _ = client.delete_object().bucket(&bucket).key(&active_key).send().await;
+                
                 let key = format!("shards/tombstones/{}.revoked", hash_str);
                 client.put_object()
                     .bucket(&bucket)
@@ -827,12 +875,39 @@ pub fn _revert_gc_transaction(_py: Python<'_>) -> PyResult<()> {
                     .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
             }
             
-            // Delete tombstones for old shards (resurrection)
+            for item in new_xorbs_table.iter().unwrap() {
+                let (hash_key, _) = item.unwrap();
+                let hash_str = hash_key.value();
+                let active_key = format!("xorbs/default/{}", hash_str);
+                let _ = client.delete_object().bucket(&bucket).key(&active_key).send().await;
+            }
+            
+            // Delete tombstones for old shards (resurrection) and move back from bin
             for item in old_shards_table.iter().unwrap() {
                 let (hash_key, _) = item.unwrap();
                 let hash_str = hash_key.value();
+                
                 let key = format!("shards/tombstones/{}.revoked", hash_str);
                 let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+                
+                let src = format!("{}/bin/shards/{}.mdb", bucket, hash_str);
+                let dest = format!("shards/{}.mdb", hash_str);
+                if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                    let bin_key = format!("bin/shards/{}.mdb", hash_str);
+                    let _ = client.delete_object().bucket(&bucket).key(&bin_key).send().await;
+                }
+            }
+
+            for item in old_xorbs_table.iter().unwrap() {
+                let (hash_key, _) = item.unwrap();
+                let hash_str = hash_key.value();
+                
+                let src = format!("{}/bin/xorbs/{}", bucket, hash_str);
+                let dest = format!("xorbs/default/{}", hash_str);
+                if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                    let bin_key = format!("bin/xorbs/{}", hash_str);
+                    let _ = client.delete_object().bucket(&bucket).key(&bin_key).send().await;
+                }
             }
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -854,123 +929,42 @@ pub fn _revert_gc_transaction(_py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-pub fn _sweep_garbage(_py: Python<'_>) -> PyResult<()> {
+pub fn _prune_garbage(_py: Python<'_>) -> PyResult<()> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = _setup_s3_client()?;
-    let txn_path = "/tmp/active_transaction.redb";
     
     rt.block_on(async {
-        let key = "gc/active_transaction.redb";
-        let resp = client.get_object().bucket(&bucket).key(key).send().await
-            .map_err(|e| format!("Failed to get lock: {:?}", e))?;
-        let data = resp.body.collect().await.map_err(|e| format!("Failed to read lock: {:?}", e))?;
-        std::fs::write(txn_path, data.into_bytes()).map_err(|e| format!("Failed to save lock: {}", e))?;
-        Ok::<_, String>(())
-    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-    
-    let db = Database::create(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
-    let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn err: {e}")))?;
-    
-    let meta = read_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-    let status_val = meta.get("status").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-    
-    if status_val.is_none() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("No status found in transaction"));
-    }
-    
-    let status = status_val.unwrap().value().to_string();
-    
-    let is_commit = if status == "committed" { true } else if status == "reverted" { false } else {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Cannot sweep: status is {}", status)));
-    };
-    
-    // We need to delete old_xorbs and old_shards if committed, OR new_xorbs and new_shards if reverted.
-    let mut xorbs_to_delete: Vec<String> = Vec::new();
-    if is_commit {
-        let old_xorbs = read_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        for item in old_xorbs.iter().unwrap() { xorbs_to_delete.push(item.unwrap().0.value().to_string()); }
-    } else {
-        let new_xorbs = read_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        for item in new_xorbs.iter().unwrap() { xorbs_to_delete.push(item.unwrap().0.value().to_string()); }
-    }
-
-    let mut shards_to_delete: Vec<String> = Vec::new();
-    if is_commit {
-        let old_shards = read_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        for item in old_shards.iter().unwrap() { shards_to_delete.push(item.unwrap().0.value().to_string()); }
-    } else {
-        let new_shards = read_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        for item in new_shards.iter().unwrap() { shards_to_delete.push(item.unwrap().0.value().to_string()); }
-    }
-
-    let mut new_xorbs_to_delete: Vec<String> = Vec::new();
-    let new_xorbs_table = read_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-    for item in new_xorbs_table.iter().unwrap() { new_xorbs_to_delete.push(item.unwrap().0.value().to_string()); }
-
-    let mut new_shards_to_delete: Vec<String> = Vec::new();
-    let new_shards_table = read_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-    for item in new_shards_table.iter().unwrap() { new_shards_to_delete.push(item.unwrap().0.value().to_string()); }
-    
-    // Explicitly drop the database to release the file lock and save memory before long S3 operations
-    drop(db);
-    
-    rt.block_on(async {
-        // Recycle Bin XORBs
-        for hash_str in &xorbs_to_delete {
-            let key = format!("xorbs/default/{}", hash_str);
-            let dest = format!("gc_sweep/{}", key);
-            let src = format!("{}/{}", bucket, key);
-            if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
-                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+        // Delete everything in bin/ and gc_consolidated/ immediately
+        for prefix in &["bin/", "gc_consolidated/"] {
+            let mut continuation_token = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(*prefix);
+                if let Some(token) = continuation_token {
+                    req = req.continuation_token(token);
+                }
+                let resp = match req.send().await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                
+                for obj in resp.contents() {
+                    if let Some(key) = obj.key() {
+                        let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+                    }
+                }
+                
+                continuation_token = resp.next_continuation_token().map(String::from);
+                if continuation_token.is_none() {
+                    break;
+                }
             }
         }
         
-        // Recycle Bin Shards
-        for hash_str in &shards_to_delete {
-            let key = format!("shards/{}.mdb", hash_str);
-            let dest = format!("gc_sweep/{}", key);
-            let src = format!("{}/{}", bucket, key);
-            if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
-                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
-            }
-        }
-        
-        // ALWAYS Delete Staging versions from gc_consolidated/
-        for hash_str in &new_xorbs_to_delete {
-            let key = format!("gc_consolidated/xorbs/{}", hash_str);
-            let dest = format!("gc_sweep/{}", key);
-            let src = format!("{}/{}", bucket, key);
-            if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
-                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
-            }
-        }
-        for hash_str in &new_shards_to_delete {
-            let key = format!("gc_consolidated/shards/{}.mdb", hash_str);
-            let dest = format!("gc_sweep/{}", key);
-            let src = format!("{}/{}", bucket, key);
-            if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
-                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
-            }
-        }
-        
+        // Delete tombstones older than 7 days
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        
-        // Finally, move the transaction lock file itself to the recycle bin (with timestamp so we have an audit log!)
-        let lock_key = "gc/active_transaction.redb";
-        let dest_lock = format!("gc_sweep/gc/active_transaction_{}.redb", now);
-        let src_lock = format!("{}/{}", bucket, lock_key);
-        
-        if let Ok(_) = client.copy_object().copy_source(&src_lock).bucket(&bucket).key(&dest_lock).send().await {
-            let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
-        } else {
-            // Fallback to just deleting if copy fails for some reason
-            let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
-        }
-        
-        // As a final cleanup step, delete any tombstones older than 7 days
-        let mut continuation_token = None;
         let seven_days = 7 * 24 * 60 * 60;
         
+        let mut continuation_token = None;
         loop {
             let mut req = client.list_objects_v2().bucket(&bucket).prefix("shards/tombstones/");
             if let Some(token) = continuation_token {
@@ -978,25 +972,19 @@ pub fn _sweep_garbage(_py: Python<'_>) -> PyResult<()> {
             }
             let resp = match req.send().await {
                 Ok(r) => r,
-                Err(_) => break, // If listing fails, we just skip tombstone cleanup for this run
+                Err(_) => break,
             };
             
             for obj in resp.contents() {
                 if let Some(last_modified) = obj.last_modified() {
                     if now - last_modified.secs() > seven_days {
                         if let Some(key) = obj.key() {
-                            // key is something like "shards/tombstones/12345.revoked"
                             if key.ends_with(".revoked") {
-                                let file_name = key.split('/').last().unwrap(); // "12345.revoked"
-                                let hash_str = file_name.strip_suffix(".revoked").unwrap(); // "12345"
-                                
+                                let file_name = key.split('/').last().unwrap();
+                                let hash_str = file_name.strip_suffix(".revoked").unwrap();
                                 let shard_key = format!("shards/{}.mdb", hash_str);
-                                
-                                // Permanently delete the orphaned shard
                                 let _ = client.delete_object().bucket(&bucket).key(&shard_key).send().await;
                             }
-                            
-                            // Delete the tombstone itself
                             let _ = client.delete_object().bucket(&bucket).key(key).send().await;
                         }
                     }
@@ -1009,10 +997,33 @@ pub fn _sweep_garbage(_py: Python<'_>) -> PyResult<()> {
             }
         }
         
+        // Delete lock file if it exists and is committed or reverted
+        let txn_path = "/tmp/active_transaction.redb";
+        let lock_key = "gc/active_transaction.redb";
+        
+        if let Ok(resp) = client.get_object().bucket(&bucket).key(lock_key).send().await {
+            if let Ok(data) = resp.body.collect().await {
+                if let Ok(_) = std::fs::write(txn_path, data.into_bytes()) {
+                    if let Ok(db) = Database::create(txn_path) {
+                        if let Ok(read_txn) = db.begin_read() {
+                            if let Ok(meta_table) = read_txn.open_table(TXN_META_TABLE) {
+                                if let Ok(Some(status)) = meta_table.get("status") {
+                                    let status_val = status.value().to_string();
+                                    if status_val == "committed" || status_val == "reverted" {
+                                        let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(txn_path);
+
         Ok::<_, String>(())
     }).unwrap();
     
-    let _ = std::fs::remove_file(txn_path);
     Ok(())
 }
 
@@ -1088,6 +1099,17 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
     }
     dict.set_item("old_xorbs", old_xorbs)?;
 
+    let missing_files = pyo3::types::PyList::empty(py);
+    if let Ok(table) = read_txn.open_table(TXN_MISSING_FILES_TABLE) {
+        if let Ok(iter) = table.iter() {
+            for item in iter {
+                let (k, _) = item.unwrap();
+                missing_files.append(k.value())?;
+            }
+        }
+    }
+    dict.set_item("missing_files", missing_files)?;
+
     drop(read_txn);
     drop(db);
     let _ = std::fs::remove_file(&txn_path);
@@ -1095,36 +1117,3 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
     Ok(dict.into())
 }
 
-pub fn _purge_garbage(_py: Python<'_>) -> PyResult<()> {
-    let rt = Runtime::new().unwrap();
-    let (client, bucket) = _setup_s3_client()?;
-    
-    rt.block_on(async {
-        let mut continuation_token = None;
-        loop {
-            let mut req = client.list_objects_v2().bucket(&bucket).prefix("gc_sweep/");
-            if let Some(token) = continuation_token {
-                req = req.continuation_token(token);
-            }
-            let resp = req.send().await;
-            
-            if let Ok(resp) = resp {
-                for object in resp.contents() {
-                    if let Some(key) = object.key() {
-                        let _ = client.delete_object().bucket(&bucket).key(key).send().await;
-                    }
-                }
-                if resp.is_truncated() == Some(true) {
-                    continuation_token = resp.next_continuation_token().map(|s| s.to_string());
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        Ok::<_, String>(())
-    }).unwrap();
-    
-    Ok(())
-}
