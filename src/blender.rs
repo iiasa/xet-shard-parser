@@ -161,7 +161,6 @@ pub fn _consolidate_metadata(
                 },
                 Err(e) => {
                     let err_str = format!("{:?}", e);
-                    println!("GC DEBUG: S3 fetch failed with error: {}", err_str);
                     if err_str.contains("NoSuchKey") || err_str.contains("NotFound") {
                         Ok::<Option<Vec<u8>>, String>(None)
                     } else {
@@ -173,10 +172,7 @@ pub fn _consolidate_metadata(
 
         let xorb_bytes = match xorb_bytes_opt {
             Some(b) => b,
-            None => {
-                println!("GC DEBUG: SKIP! XORB {} not found in S3!", xorb_hash_str);
-                continue;
-            }
+            None => continue,
         };
 
         if let Some((hashes, boundaries, unpacked)) = parse_xorb_footer_data(&xorb_bytes) {
@@ -190,8 +186,6 @@ pub fn _consolidate_metadata(
                 layout_table.insert(&layout_key, &h_bytes).unwrap();
                 
                 let is_live = live_chunks.get(&h_bytes).unwrap().is_some();
-                println!("GC DEBUG: Checking chunk {} in XORB {} -> is_live={}", h.hex(), xorb_hash_str, is_live);
-                
                 if is_live {
                     let start = if i == 0 { 0 } else { boundaries[i - 1] as usize };
                     let end = boundaries[i] as usize;
@@ -293,43 +287,34 @@ pub fn _consolidate_metadata(
                 }
             }
 
-            println!("GC DEBUG: Shard has {} files", minimal_shard.num_files());
             for i in 0..minimal_shard.num_files() {
                 if let Some(file_view) = minimal_shard.file(i) {
                     let fh_bytes: [u8; 32] = file_view.file_hash().into();
-                    println!("GC DEBUG: Checking file {}", file_view.file_hash().hex());
                     if live_files.get(&fh_bytes).unwrap().is_some() {
-                        println!("GC DEBUG: File {} is live!", file_view.file_hash().hex());
                         let mut file_info = MDBFileInfo::from(file_view);
                         let mut valid = true;
                         
                         for seg in &mut file_info.segments {
-                        println!("GC DEBUG: File {} has segment with xorb {}", file_view.file_hash().hex(), seg.xorb_hash.hex());
-                        let seg_hash_bytes: [u8; 32] = seg.xorb_hash.into();
-                        let is_sparse = sparse_xorbs.get(&seg_hash_bytes).unwrap().is_some();
-                        println!("GC DEBUG: Is segment sparse? {}", is_sparse);
-                        if is_sparse {
+                            let seg_hash_bytes: [u8; 32] = seg.xorb_hash.into();
+                            let is_sparse = sparse_xorbs.get(&seg_hash_bytes).unwrap().is_some();
+                            if is_sparse {
                                 let mut layout_key = [0u8; 36];
                                 layout_key[0..32].copy_from_slice(&seg_hash_bytes);
                                 layout_key[32..36].copy_from_slice(&seg.chunk_index_start.to_le_bytes());
                                 
                                 if let Some(chunk_hash_val) = layout_table.get(&layout_key).unwrap() {
                                     let first_chunk_bytes: [u8; 32] = *chunk_hash_val.value();
-                                    let first_chunk_hash = MerkleHash::from(first_chunk_bytes);
                                     
                                     if let Some(chunk_val) = chunk_map_table.get(&first_chunk_bytes).unwrap() {
                                         let val = chunk_val.value();
                                         let new_xorb_hash = MerkleHash::from(<[u8; 32]>::try_from(&val[0..32]).unwrap());
                                         let new_start_idx = u32::from_le_bytes(val[32..36].try_into().unwrap());
                                         
-                                        println!("GC DEBUG: Translating segment chunk {} -> new XORB {} idx {}", first_chunk_hash.hex(), new_xorb_hash.hex(), new_start_idx);
-                                        
                                         seg.xorb_hash = new_xorb_hash;
                                         let length = seg.chunk_index_end - seg.chunk_index_start;
                                         seg.chunk_index_start = new_start_idx;
                                         seg.chunk_index_end = new_start_idx + length;
                                     } else {
-                                        println!("GC DEBUG: VALID=FALSE! Chunk {} not found in map for XORB {}", first_chunk_hash.hex(), seg.xorb_hash.hex());
                                         valid = false;
                                         break;
                                     }
@@ -434,7 +419,7 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
-    let db = Database::create(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
+    let db = Database::open(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
     let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
     
     {
@@ -559,7 +544,7 @@ pub fn _verify_gc_transaction(
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
-    let db = Database::create(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
+    let db = Database::open(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
     let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
     
     {
@@ -602,34 +587,56 @@ pub fn _verify_gc_transaction(
             let shard_path = sfm.shard_directory().join(format!("{}.mdb", hash_hex));
             let _ = std::fs::remove_file(shard_path);
         }
-        let _ = rt.block_on(async { sfm.refresh_shard_dir(false, 0).await });
     }
     
-    // 1. Build Future State map from staging shards
-    let mut new_file_deps = std::collections::HashMap::new();
+    // 1. Download staging shards, cryptographically verify, and save to SFM disk
+    let mut validation_err = None;
     rt.block_on(async {
         for shard_hash in &new_shards {
             let key = format!("gc_consolidated/shards/{}.mdb", shard_hash);
-            let resp = client.get_object().bucket(&bucket).key(&key).send().await;
-            if let Ok(r) = resp {
+            if let Ok(r) = client.get_object().bucket(&bucket).key(&key).send().await {
                 if let Ok(data) = r.body.collect().await {
                     let bytes = data.into_bytes();
-                    if let Ok(minimal_shard) = MDBMinimalShard::from_reader(&mut std::io::Cursor::new(&bytes), true, true) {
-                        for i in 0..minimal_shard.num_files() {
-                            if let Some(file_view) = minimal_shard.file(i) {
-                                let mut deps = Vec::new();
-                                for seg in 0..file_view.num_entries() {
-                                    let segment = file_view.entry(seg);
-                                    deps.push(segment.xorb_hash.hex());
-                                }
-                                new_file_deps.insert(file_view.file_hash().hex(), deps);
-                            }
-                        }
+                    
+                    // Hybrid Check: Strictly verify the Merkle/CRC bytes
+                    if let Err(e) = MDBMinimalShard::from_reader(&mut std::io::Cursor::new(&bytes), true, true) {
+                        validation_err = Some(format!("Cryptographic validation failed for {}: {:?}", shard_hash, e));
+                        break;
                     }
+                    
+                    // Save pristine shard directly to the local sfm cache disk
+                    let shard_path = sfm.shard_directory().join(format!("{}.mdb", shard_hash));
+                    if let Err(e) = std::fs::write(&shard_path, &bytes) {
+                        validation_err = Some(format!("Failed to write verified shard {} to disk: {:?}", shard_hash, e));
+                        break;
+                    }
+                } else {
+                    validation_err = Some(format!("Failed to download body for {}", shard_hash));
+                    break;
                 }
+            } else {
+                validation_err = Some(format!("Failed to fetch staged shard {}", shard_hash));
+                break;
             }
         }
+        
+        if validation_err.is_none() {
+            // Load the newly saved, verified shards into the sfm index natively, alongside surviving shards
+            let _ = sfm.refresh_shard_dir(false, 0).await;
+        }
     });
+
+    if let Some(err_msg) = validation_err {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(err_msg));
+    }
+
+    // Create a fresh isolated ShardFileManager instance from disk to guarantee zero in-memory stale handles
+    let verify_sfm = rt.block_on(async {
+        let ctx = xet_runtime::core::context::XetContext::default()
+            .map_err(|e| format!("Failed to create context: {:?}", e))?;
+        ShardFileManager::new_in_cache_directory(&ctx, sfm.shard_directory()).await
+            .map_err(|e| format!("Failed to create verification ShardFileManager: {:?}", e))
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
 
     // 2. Gather unique XORB dependencies for all live files (Pass 1)
     let mut unique_s3_xorbs = std::collections::HashSet::new();
@@ -650,20 +657,15 @@ pub fn _verify_gc_transaction(
                 let mut xorb_deps = Vec::new();
                 let mut found = true;
                 
-                if let Some(deps) = new_file_deps.get(&file_hash_hex) {
-                    xorb_deps = deps.clone();
-                } else {
-                    // Untouched file -> safely check SFM
-                    let res = rt.block_on(async { sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
-                    match res {
-                        Ok(Some((info, _))) => {
-                            for segment in info.segments {
-                                xorb_deps.push(segment.xorb_hash.hex());
-                            }
-                        },
-                        _ => {
-                            found = false;
+                let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                match res {
+                    Ok(Some((info, _))) => {
+                        for segment in info.segments {
+                            xorb_deps.push(segment.xorb_hash.hex());
                         }
+                    },
+                    _ => {
+                        found = false;
                     }
                 }
                 
@@ -738,15 +740,10 @@ pub fn _verify_gc_transaction(
                     }
                     
                     let mut xorb_deps = Vec::new();
-                    if let Some(deps) = new_file_deps.get(&file_hash_hex) {
-                        xorb_deps = deps.clone();
-                    } else {
-                        // Untouched file -> safely check SFM
-                        let res = rt.block_on(async { sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
-                        if let Ok(Some((info, _))) = res {
-                            for segment in info.segments {
-                                xorb_deps.push(segment.xorb_hash.hex());
-                            }
+                    let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                    if let Ok(Some((info, _))) = res {
+                        for segment in info.segments {
+                            xorb_deps.push(segment.xorb_hash.hex());
                         }
                     }
                     if xorb_deps.iter().any(|xh| missing_xorbs.contains(xh)) {
@@ -796,7 +793,7 @@ pub fn _commit_gc_transaction(_py: Python<'_>) -> PyResult<()> {
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
-    let db = Database::create(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
+    let db = Database::open(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
     let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
     
     {
@@ -840,7 +837,7 @@ pub fn _revert_gc_transaction(_py: Python<'_>) -> PyResult<()> {
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
-    let db = Database::create(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
+    let db = Database::open(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
     let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
     
     {
@@ -1004,7 +1001,7 @@ pub fn _prune_garbage(_py: Python<'_>) -> PyResult<()> {
         if let Ok(resp) = client.get_object().bucket(&bucket).key(lock_key).send().await {
             if let Ok(data) = resp.body.collect().await {
                 if let Ok(_) = std::fs::write(txn_path, data.into_bytes()) {
-                    if let Ok(db) = Database::create(txn_path) {
+                    if let Ok(db) = Database::open(txn_path) {
                         if let Ok(read_txn) = db.begin_read() {
                             if let Ok(meta_table) = read_txn.open_table(TXN_META_TABLE) {
                                 if let Ok(Some(status)) = meta_table.get("status") {
@@ -1041,7 +1038,7 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
-    let db = Database::create(&txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
+    let db = Database::open(&txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
     let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn err: {e}")))?;
     
     let dict = pyo3::types::PyDict::new(py);

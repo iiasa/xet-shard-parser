@@ -360,28 +360,18 @@ impl ShardIndex {
             cumulative_bytes += n;
         }
 
-        println!("[Rust Cas Debug] needed_xorbs count: {}", needed_xorbs.len());
-        let keys = xorb_urls.keys();
-        println!("[Rust Cas Debug] xorb_urls keys: {:?}", keys);
-
-        // Concurrenty fetch footers for required XORBs
+        // Concurrently fetch footers for required XORBs
         let mut xorb_footers = std::collections::HashMap::new();
         let mut fetch_tasks = Vec::new();
 
         for xh in needed_xorbs {
             let xh_hex = xh.hex();
             let mut found = false;
-            println!("[Rust Cas Debug] Looking up xh_hex: {}", xh_hex);
             if let Ok(Some(url_obj)) = xorb_urls.get_item(&xh_hex) {
                 if let Ok(url) = url_obj.extract::<String>() {
-                    println!("[Rust Cas Debug] Found URL: {}", url);
                     fetch_tasks.push((xh, url));
                     found = true;
-                } else {
-                    println!("[Rust Cas Debug] Failed to extract URL string");
                 }
-            } else {
-                println!("[Rust Cas Debug] xorb_urls does not contain {}", xh_hex);
             }
             if !found {
                 xorb_footers.insert(xh, None);
@@ -396,7 +386,7 @@ impl ShardIndex {
                     .map(|(xh, url)| {
                         let client = client.clone();
                         async move {
-                            // Fetch last 64KB for footer
+                            // Fetch last 1MB for footer
                             let resp = client.get(&url)
                                 .header("Range", "bytes=-1048576")
                                 .send()
@@ -407,14 +397,7 @@ impl ShardIndex {
                                     let bytes = r.bytes().await.ok().map(|b| b.to_vec());
                                     (xh, bytes)
                                 }
-                                Ok(r) => {
-                                    eprintln!("[Rust Cas Debug] Fetch footer failed for {}: status={}", url, r.status());
-                                    (xh, None)
-                                }
-                                Err(e) => {
-                                    eprintln!("[Rust Cas Debug] Fetch footer request failed for {}: error={}", url, e);
-                                    (xh, None)
-                                }
+                                _ => (xh, None),
                             }
                         }
                     })
