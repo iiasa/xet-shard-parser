@@ -32,7 +32,8 @@ pub const TXN_NEW_SHARDS_TABLE: TableDefinition<&str, ()> = TableDefinition::new
 pub const TXN_CHUNK_MAP_TABLE: TableDefinition<&[u8; 32], &[u8; 36]> = TableDefinition::new("txn_chunk_map");
 pub const TXN_XORB_LAYOUT_TABLE: TableDefinition<&[u8; 36], &[u8; 32]> = TableDefinition::new("txn_xorb_layout");
 pub const TXN_MISSING_FILES_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_missing_files");
-
+pub const TXN_UNIQUE_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_unique_xorbs");
+pub const TXN_MISSING_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_missing_xorbs");
 fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
     let mut reader = Cursor::new(bytes);
     let xorb_obj = XorbObject::deserialize(&mut reader).ok()?;
@@ -559,11 +560,8 @@ pub fn _verify_gc_transaction(
         }
     }
     
-    // Integrity Verification (Pass 1 and 2)
-    // Extract new shards and old XORBs into memory
+    // Extract new shards into memory
     let mut new_shards = Vec::new();
-    let mut old_xorbs = std::collections::HashSet::new();
-    let mut old_shards = std::collections::HashSet::new();
     
     if let Ok(shards_table) = write_txn.open_table(TXN_NEW_SHARDS_TABLE) {
         for item in shards_table.iter().unwrap() {
@@ -571,17 +569,10 @@ pub fn _verify_gc_transaction(
             new_shards.push(hash_key.value().to_string());
         }
     }
-    if let Ok(xorbs_table) = write_txn.open_table(TXN_OLD_XORBS_TABLE) {
-        for item in xorbs_table.iter().unwrap() {
-            let (hash_key, _) = item.unwrap();
-            old_xorbs.insert(hash_key.value().to_string());
-        }
-    }
     if let Ok(old_shards_table) = write_txn.open_table(TXN_OLD_SHARDS_TABLE) {
         for item in old_shards_table.iter().unwrap() {
             let (hash_key, _) = item.unwrap();
             let hash_hex = hash_key.value().to_string();
-            old_shards.insert(hash_hex.clone());
             
             // Prune old shards from sfm so it is forced to use surviving shards
             let shard_path = sfm.shard_directory().join(format!("{}.mdb", hash_hex));
@@ -639,10 +630,11 @@ pub fn _verify_gc_transaction(
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
 
     // 2. Gather unique XORB dependencies for all live files (Pass 1)
-    let mut unique_s3_xorbs = std::collections::HashSet::new();
     let mut missing_count = 0;
     
     let mut missing_table = write_txn.open_table(TXN_MISSING_FILES_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    let mut unique_xorbs_table = write_txn.open_table(TXN_UNIQUE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    let old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
     let gc_db_lock = gc_db.read().unwrap();
     if let Some(ref gcdb) = *gc_db_lock {
@@ -677,13 +669,13 @@ pub fn _verify_gc_transaction(
                 
                 // Validate XORBs
                 for xh in &xorb_deps {
-                    if old_xorbs.contains(xh) {
+                    if old_xorbs_table.get(xh.as_str()).unwrap().is_some() {
                         // Dangling pointer to deleted tombstone!
                         missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
                         missing_count += 1;
                         break;
                     }
-                    unique_s3_xorbs.insert(xh.clone());
+                    unique_xorbs_table.insert(xh.as_str(), ()).unwrap();
                 }
             }
         }
@@ -691,41 +683,62 @@ pub fn _verify_gc_transaction(
     
     // 3. Concurrently verify all required XORBs actually exist physically
     use futures::stream::{StreamExt, iter};
-    let mut missing_xorbs = std::collections::HashSet::new();
+    let mut missing_xorbs_table = write_txn.open_table(TXN_MISSING_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
-    let verification_results = rt.block_on(async {
-        let futures_iter = unique_s3_xorbs.into_iter().map(|xorb_hash_hex| {
-            let client = client.clone();
-            let bucket = bucket.clone();
-            async move {
-                let key_staged = format!("gc_consolidated/xorbs/{}", xorb_hash_hex);
-                let key_live = format!("xorbs/default/{}", xorb_hash_hex);
-                
-                // Check staged first (faster since GC just put them there)
-                if client.head_object().bucket(&bucket).key(&key_staged).send().await.is_ok() {
-                    return (xorb_hash_hex, true);
+    let mut batch = Vec::with_capacity(100);
+    let mut process_batch = |b: &mut Vec<String>| {
+        let results = rt.block_on(async {
+            let futures_iter = b.iter().map(|xorb_hash_hex| {
+                let client = client.clone();
+                let bucket = bucket.clone();
+                let xh = xorb_hash_hex.clone();
+                async move {
+                    let key_staged = format!("gc_consolidated/xorbs/{}", xh);
+                    let key_live = format!("xorbs/default/{}", xh);
+                    
+                    if client.head_object().bucket(&bucket).key(&key_staged).send().await.is_ok() {
+                        return (xh, true);
+                    }
+                    if client.head_object().bucket(&bucket).key(&key_live).send().await.is_ok() {
+                        return (xh, true);
+                    }
+                    (xh, false)
                 }
-                if client.head_object().bucket(&bucket).key(&key_live).send().await.is_ok() {
-                    return (xorb_hash_hex, true);
-                }
-                (xorb_hash_hex, false)
-            }
+            });
+            
+            iter(futures_iter)
+                .buffer_unordered(100)
+                .collect::<Vec<(String, bool)>>()
+                .await
         });
         
-        iter(futures_iter)
-            .buffer_unordered(100)
-            .collect::<Vec<(String, bool)>>()
-            .await
-    });
-    
-    for (xh, exists) in verification_results {
-        if !exists {
-            missing_xorbs.insert(xh);
+        for (xh, exists) in results {
+            if !exists {
+                missing_xorbs_table.insert(xh.as_str(), ()).unwrap();
+            }
         }
+        b.clear();
+    };
+
+    for item in unique_xorbs_table.iter().unwrap() {
+        let (k, _) = item.unwrap();
+        batch.push(k.value().to_string());
+        if batch.len() >= 100 {
+            process_batch(&mut batch);
+        }
+    }
+    if !batch.is_empty() {
+        process_batch(&mut batch);
     }
     
     // 4. Second pass to stream files and check for missing XORB intersections
-    if !missing_xorbs.is_empty() {
+    let mut missing_xorbs_empty = true;
+    for _ in missing_xorbs_table.iter().unwrap() {
+        missing_xorbs_empty = false;
+        break;
+    }
+
+    if !missing_xorbs_empty {
         if let Some(ref gcdb) = *gc_db_lock {
             let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
             if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
@@ -746,7 +759,15 @@ pub fn _verify_gc_transaction(
                             xorb_deps.push(segment.xorb_hash.hex());
                         }
                     }
-                    if xorb_deps.iter().any(|xh| missing_xorbs.contains(xh)) {
+                    
+                    let mut has_missing = false;
+                    for xh in xorb_deps {
+                        if missing_xorbs_table.get(xh.as_str()).unwrap().is_some() {
+                            has_missing = true;
+                            break;
+                        }
+                    }
+                    if has_missing {
                         missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
                         missing_count += 1;
                     }
@@ -764,6 +785,9 @@ pub fn _verify_gc_transaction(
     }
     
     drop(missing_table);
+    drop(unique_xorbs_table);
+    drop(old_xorbs_table);
+    drop(missing_xorbs_table);
 
     write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit err: {e}")))?;
     drop(db);
