@@ -154,21 +154,7 @@ pub fn _consolidate_metadata(
 
         let xorb_bytes_opt = rt.block_on(async {
             let key = format!("xorbs/default/{}", xorb_hash_str);
-            match client.get_object().bucket(&bucket).key(&key).send().await {
-                Ok(resp) => {
-                    let data = resp.body.collect().await
-                        .map_err(|e| format!("Failed to collect {}: {:?}", key, e))?;
-                    Ok::<Option<Vec<u8>>, String>(Some(data.into_bytes().to_vec()))
-                },
-                Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    if err_str.contains("NoSuchKey") || err_str.contains("NotFound") {
-                        Ok::<Option<Vec<u8>>, String>(None)
-                    } else {
-                        Err(format!("Failed to get {}: {}", key, err_str))
-                    }
-                }
-            }
+            download_with_retry(&client, &bucket, &key, 5).await
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
 
         let xorb_bytes = match xorb_bytes_opt {
@@ -406,6 +392,36 @@ fn _setup_s3_client() -> PyResult<(Client, String)> {
     Ok((Client::from_conf(config), bucket))
 }
 
+async fn download_with_retry(client: &Client, bucket: &str, key: &str, max_attempts: u32) -> Result<Option<Vec<u8>>, String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(resp) => {
+                match resp.body.collect().await {
+                    Ok(data) => return Ok(Some(data.into_bytes().to_vec())),
+                    Err(e) => {
+                        if attempts >= max_attempts {
+                            return Err(format!("Failed to collect {}: {:?}", key, e));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
+                    }
+                }
+            }
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("NoSuchKey") || err_str.contains("NotFound") {
+                    return Ok(None);
+                }
+                if attempts >= max_attempts {
+                    return Err(format!("Failed to get {}: {}", key, err_str));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
+            }
+        }
+    }
+}
+
 pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = _setup_s3_client()?;
@@ -413,10 +429,9 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let resp = client.get_object().bucket(&bucket).key(key).send().await
-            .map_err(|e| format!("Failed to get lock: {:?}", e))?;
-        let data = resp.body.collect().await.map_err(|e| format!("Failed to read lock: {:?}", e))?;
-        std::fs::write(txn_path, data.into_bytes()).map_err(|e| format!("Failed to save lock: {}", e))?;
+        let data = download_with_retry(&client, &bucket, key, 5).await?
+            .ok_or_else(|| format!("Lock file {} not found", key))?;
+        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
@@ -538,10 +553,9 @@ pub fn _verify_gc_transaction(
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let resp = client.get_object().bucket(&bucket).key(key).send().await
-            .map_err(|e| format!("Failed to get lock: {:?}", e))?;
-        let data = resp.body.collect().await.map_err(|e| format!("Failed to read lock: {:?}", e))?;
-        std::fs::write(txn_path, data.into_bytes()).map_err(|e| format!("Failed to save lock: {}", e))?;
+        let data = download_with_retry(&client, &bucket, key, 5).await?
+            .ok_or_else(|| format!("Lock file {} not found", key))?;
+        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
@@ -585,10 +599,8 @@ pub fn _verify_gc_transaction(
     rt.block_on(async {
         for shard_hash in &new_shards {
             let key = format!("gc_consolidated/shards/{}.mdb", shard_hash);
-            if let Ok(r) = client.get_object().bucket(&bucket).key(&key).send().await {
-                if let Ok(data) = r.body.collect().await {
-                    let bytes = data.into_bytes();
-                    
+            match download_with_retry(&client, &bucket, &key, 5).await {
+                Ok(Some(bytes)) => {
                     // Hybrid Check: Strictly verify the Merkle/CRC bytes
                     if let Err(e) = MDBMinimalShard::from_reader(&mut std::io::Cursor::new(&bytes), true, true) {
                         validation_err = Some(format!("Cryptographic validation failed for {}: {:?}", shard_hash, e));
@@ -601,13 +613,15 @@ pub fn _verify_gc_transaction(
                         validation_err = Some(format!("Failed to write verified shard {} to disk: {:?}", shard_hash, e));
                         break;
                     }
-                } else {
+                }
+                Ok(None) => {
                     validation_err = Some(format!("Failed to download body for {}", shard_hash));
                     break;
                 }
-            } else {
-                validation_err = Some(format!("Failed to fetch staged shard {}", shard_hash));
-                break;
+                Err(e) => {
+                    validation_err = Some(format!("Failed to fetch staged shard {}: {:?}", shard_hash, e));
+                    break;
+                }
             }
         }
         
@@ -810,10 +824,9 @@ pub fn _commit_gc_transaction(_py: Python<'_>) -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let resp = client.get_object().bucket(&bucket).key(key).send().await
-            .map_err(|e| format!("Failed to get lock: {:?}", e))?;
-        let data = resp.body.collect().await.map_err(|e| format!("Failed to read lock: {:?}", e))?;
-        std::fs::write(txn_path, data.into_bytes()).map_err(|e| format!("Failed to save lock: {}", e))?;
+        let data = download_with_retry(&client, &bucket, key, 5).await?
+            .ok_or_else(|| format!("Lock file {} not found", key))?;
+        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
@@ -854,10 +867,9 @@ pub fn _revert_gc_transaction(_py: Python<'_>) -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let resp = client.get_object().bucket(&bucket).key(key).send().await
-            .map_err(|e| format!("Failed to get lock: {:?}", e))?;
-        let data = resp.body.collect().await.map_err(|e| format!("Failed to read lock: {:?}", e))?;
-        std::fs::write(txn_path, data.into_bytes()).map_err(|e| format!("Failed to save lock: {}", e))?;
+        let data = download_with_retry(&client, &bucket, key, 5).await?
+            .ok_or_else(|| format!("Lock file {} not found", key))?;
+        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
@@ -1022,17 +1034,15 @@ pub fn _prune_garbage(_py: Python<'_>) -> PyResult<()> {
         let txn_path = "/tmp/active_transaction.redb";
         let lock_key = "gc/active_transaction.redb";
         
-        if let Ok(resp) = client.get_object().bucket(&bucket).key(lock_key).send().await {
-            if let Ok(data) = resp.body.collect().await {
-                if let Ok(_) = std::fs::write(txn_path, data.into_bytes()) {
-                    if let Ok(db) = Database::open(txn_path) {
-                        if let Ok(read_txn) = db.begin_read() {
-                            if let Ok(meta_table) = read_txn.open_table(TXN_META_TABLE) {
-                                if let Ok(Some(status)) = meta_table.get("status") {
-                                    let status_val = status.value().to_string();
-                                    if status_val == "committed" || status_val == "reverted" {
-                                        let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
-                                    }
+        if let Ok(Some(data)) = download_with_retry(&client, &bucket, lock_key, 5).await {
+            if let Ok(_) = std::fs::write(txn_path, data) {
+                if let Ok(db) = Database::open(txn_path) {
+                    if let Ok(read_txn) = db.begin_read() {
+                        if let Ok(meta_table) = read_txn.open_table(TXN_META_TABLE) {
+                            if let Ok(Some(status)) = meta_table.get("status") {
+                                let status_val = status.value().to_string();
+                                if status_val == "committed" || status_val == "reverted" {
+                                    let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
                                 }
                             }
                         }
@@ -1055,10 +1065,9 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let resp = client.get_object().bucket(&bucket).key(key).send().await
-            .map_err(|e| format!("Failed to get lock: {:?}", e))?;
-        let data = resp.body.collect().await.map_err(|e| format!("Failed to read lock: {:?}", e))?;
-        std::fs::write(&txn_path, data.into_bytes()).map_err(|e| format!("Failed to save lock: {}", e))?;
+        let data = download_with_retry(&client, &bucket, key, 5).await?
+            .ok_or_else(|| format!("Lock file {} not found", key))?;
+        std::fs::write(&txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
