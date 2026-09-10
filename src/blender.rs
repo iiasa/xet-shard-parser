@@ -44,7 +44,6 @@ fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Ve
 use mdb_shard::metadata_shard::ShardFileManager;
 
 pub fn _consolidate_metadata(
-    _py: Python<'_>,
     sfm: Arc<ShardFileManager>,
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
 ) -> PyResult<()> {
@@ -143,50 +142,143 @@ pub fn _consolidate_metadata(
         Ok(())
     };
 
-    // 2. Process Sparse XORBs Incrementally
+    // 2. Process Sparse XORBs Incrementally with Parallel Fetching and HTTP Range
+    let mut sparse_keys = Vec::new();
     for item in sparse_xorbs.iter().unwrap() {
         let (k, _) = item.unwrap();
-        let hash_bytes = k.value();
-        let xorb_hash = MerkleHash::from(*hash_bytes);
-        let xorb_hash_str = xorb_hash.hex();
+        sparse_keys.push(*k.value());
+    }
+    
+    let total_sparse = sparse_keys.len();
+    eprintln!("[GC] Found {} sparse XORBs to consolidate.", total_sparse);
+
+    let batch_size = 50;
+    for (batch_idx, chunk) in sparse_keys.chunks(batch_size).enumerate() {
+        eprintln!("[GC] Processing sparse XORB batch {}/{}...", batch_idx + 1, (total_sparse + batch_size - 1) / batch_size);
         
-        old_xorbs_table.insert(xorb_hash_str.as_str(), ()).unwrap();
-
-        let xorb_bytes_opt = rt.block_on(async {
-            let key = format!("xorbs/default/{}", xorb_hash_str);
-            download_with_retry(&client, &bucket, &key, 5).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-
-        let xorb_bytes = match xorb_bytes_opt {
-            Some(b) => b,
-            None => continue,
-        };
-
-        if let Some((hashes, boundaries, unpacked)) = parse_xorb_footer_data(&xorb_bytes) {
-            for i in 0..hashes.len() {
-                let h = hashes[i];
-                let h_bytes: [u8; 32] = h.into();
-                
-                let mut layout_key = [0u8; 36];
-                layout_key[0..32].copy_from_slice(hash_bytes);
-                layout_key[32..36].copy_from_slice(&(i as u32).to_le_bytes());
-                layout_table.insert(&layout_key, &h_bytes).unwrap();
-                
-                let is_live = live_chunks.get(&h_bytes).unwrap().is_some();
-                if is_live {
-                    let start = if i == 0 { 0 } else { boundaries[i - 1] as usize };
-                    let end = boundaries[i] as usize;
-                    let len = (end - start) as u32;
-                    let unp_len = if i == 0 { unpacked[0] } else { unpacked[i] - unpacked[i - 1] };
+        // 2a. Fetch Footers Concurrently
+        let footer_results = rt.block_on(async {
+            use futures::stream::{StreamExt, iter};
+            let futures_iter = chunk.iter().map(|hash_bytes| {
+                let client = client.clone();
+                let bucket = bucket.clone();
+                let hash_bytes = *hash_bytes;
+                async move {
+                    let xorb_hash = MerkleHash::from(hash_bytes);
+                    let xorb_hash_str = xorb_hash.hex();
+                    let key = format!("xorbs/default/{}", xorb_hash_str);
+                    let footer_bytes_opt = download_range_with_retry(&client, &bucket, &key, "bytes=-1048576", 5).await.ok().flatten();
+                    (hash_bytes, footer_bytes_opt)
+                }
+            });
+            iter(futures_iter).buffer_unordered(batch_size).collect::<Vec<_>>().await
+        });
+        
+        // 2b. Identify Live Chunks and coalesce ranges
+        struct RangeReq {
+            start: usize,
+            end: usize,
+            hashes: Vec<MerkleHash>,
+            unp_lens: Vec<u32>,
+            chunk_lens: Vec<usize>,
+        }
+        
+        let mut xorbs_to_fetch = Vec::new();
+        
+        for (hash_bytes, footer_bytes_opt) in footer_results {
+            let xorb_hash = MerkleHash::from(hash_bytes);
+            let xorb_hash_str = xorb_hash.hex();
+            old_xorbs_table.insert(xorb_hash_str.as_str(), ()).unwrap();
+            
+            if let Some(footer_bytes) = footer_bytes_opt {
+                if let Some((hashes, boundaries, unpacked)) = parse_xorb_footer_data(&footer_bytes) {
+                    let mut current_range: Option<RangeReq> = None;
+                    let mut ranges = Vec::new();
                     
-                    xorb_new_chunks.extend_from_slice(&xorb_bytes[start..end]);
-                    current_xorb_chunk_hashes.push(h);
-                    new_entries.push(XorbChunkSequenceEntry::new(h, unp_len, current_offset));
-                    current_offset += len;
-                    current_uncompressed_size += unp_len;
+                    for i in 0..hashes.len() {
+                        let h = hashes[i];
+                        let h_bytes: [u8; 32] = h.into();
+                        
+                        let mut layout_key = [0u8; 36];
+                        layout_key[0..32].copy_from_slice(&hash_bytes);
+                        layout_key[32..36].copy_from_slice(&(i as u32).to_le_bytes());
+                        layout_table.insert(&layout_key, &h_bytes).unwrap();
+                        
+                        let is_live = live_chunks.get(&h_bytes).unwrap().is_some();
+                        if is_live {
+                            let start = if i == 0 { 0 } else { boundaries[i - 1] as usize };
+                            let end = boundaries[i] as usize;
+                            let len = end - start;
+                            let unp_len = if i == 0 { unpacked[0] } else { unpacked[i] - unpacked[i - 1] };
+                            
+                            if let Some(ref mut req) = current_range {
+                                if req.end == start { // contiguous
+                                    req.end = end;
+                                    req.hashes.push(h);
+                                    req.unp_lens.push(unp_len);
+                                    req.chunk_lens.push(len);
+                                } else {
+                                    ranges.push(current_range.take().unwrap());
+                                    current_range = Some(RangeReq { start, end, hashes: vec![h], unp_lens: vec![unp_len], chunk_lens: vec![len] });
+                                }
+                            } else {
+                                current_range = Some(RangeReq { start, end, hashes: vec![h], unp_lens: vec![unp_len], chunk_lens: vec![len] });
+                            }
+                        }
+                    }
+                    if let Some(req) = current_range {
+                        ranges.push(req);
+                    }
+                    if !ranges.is_empty() {
+                        xorbs_to_fetch.push((hash_bytes, ranges));
+                    }
+                }
+            }
+        }
+        
+        // 2c. Fetch Live Ranges Concurrently
+        let mut range_futures = Vec::new();
+        for (hash_bytes, ranges) in xorbs_to_fetch {
+            let xorb_hash = MerkleHash::from(hash_bytes);
+            let xorb_hash_str = xorb_hash.hex();
+            for req in ranges {
+                let client = client.clone();
+                let bucket = bucket.clone();
+                let key = format!("xorbs/default/{}", xorb_hash_str);
+                let range_header = format!("bytes={}-{}", req.start, req.end - 1);
+                
+                range_futures.push(async move {
+                    let bytes_opt = download_range_with_retry(&client, &bucket, &key, &range_header, 5).await.ok().flatten();
+                    (req, bytes_opt)
+                });
+            }
+        }
+        
+        let fetched_ranges = rt.block_on(async {
+            use futures::stream::{StreamExt, iter};
+            iter(range_futures).buffer_unordered(batch_size).collect::<Vec<_>>().await
+        });
+        
+        // 2d. Process Fetched Ranges
+        for (req, bytes_opt) in fetched_ranges {
+            if let Some(bytes) = bytes_opt {
+                let mut offset = 0;
+                for j in 0..req.hashes.len() {
+                    let h = req.hashes[j];
+                    let unp_len = req.unp_lens[j];
+                    let len = req.chunk_lens[j];
                     
-                    if current_uncompressed_size >= max_xorb_size {
-                        flush_xorb_buffer(&mut xorb_new_chunks, &mut new_entries, &mut current_xorb_chunk_hashes, &mut current_offset, &mut current_uncompressed_size, &mut chunk_map_table, &mut new_xorbs_table)?;
+                    if offset + len <= bytes.len() {
+                        xorb_new_chunks.extend_from_slice(&bytes[offset..offset+len]);
+                        current_xorb_chunk_hashes.push(h);
+                        new_entries.push(XorbChunkSequenceEntry::new(h, unp_len, current_offset));
+                        current_offset += len as u32;
+                        current_uncompressed_size += unp_len;
+                        offset += len;
+                        
+                        if current_uncompressed_size >= max_xorb_size {
+                            flush_xorb_buffer(&mut xorb_new_chunks, &mut new_entries, &mut current_xorb_chunk_hashes, &mut current_offset, &mut current_uncompressed_size, &mut chunk_map_table, &mut new_xorbs_table)?;
+                        }
                     }
                 }
             }
@@ -422,7 +514,38 @@ async fn download_with_retry(client: &Client, bucket: &str, key: &str, max_attem
     }
 }
 
-pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
+
+async fn download_range_with_retry(client: &Client, bucket: &str, key: &str, range_header: &str, max_attempts: u32) -> Result<Option<Vec<u8>>, String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match client.get_object().bucket(bucket).key(key).range(range_header).send().await {
+            Ok(resp) => {
+                match resp.body.collect().await {
+                    Ok(data) => return Ok(Some(data.into_bytes().to_vec())),
+                    Err(e) => {
+                        if attempts >= max_attempts {
+                            return Err(format!("Failed to collect {}: {:?}", key, e));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
+                    }
+                }
+            }
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("NoSuchKey") || err_str.contains("NotFound") {
+                    return Ok(None);
+                }
+                if attempts >= max_attempts {
+                    return Err(format!("Failed to get {}: {}", key, err_str));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
+            }
+        }
+    }
+}
+
+pub fn _stage_gc_transaction() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = _setup_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
@@ -543,7 +666,6 @@ pub fn _stage_gc_transaction(_py: Python<'_>) -> PyResult<()> {
 }
 
 pub fn _verify_gc_transaction(
-    _py: Python<'_>,
     sfm: Arc<ShardFileManager>,
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
 ) -> PyResult<usize> {
@@ -817,7 +939,7 @@ pub fn _verify_gc_transaction(
     Ok(missing_count)
 }
 
-pub fn _commit_gc_transaction(_py: Python<'_>) -> PyResult<()> {
+pub fn _commit_gc_transaction() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = _setup_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
@@ -860,7 +982,7 @@ pub fn _commit_gc_transaction(_py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-pub fn _revert_gc_transaction(_py: Python<'_>) -> PyResult<()> {
+pub fn _revert_gc_transaction() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = _setup_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
@@ -962,7 +1084,7 @@ pub fn _revert_gc_transaction(_py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-pub fn _prune_garbage(_py: Python<'_>) -> PyResult<()> {
+pub fn _prune_garbage() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = _setup_s3_client()?;
     

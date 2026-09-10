@@ -171,53 +171,69 @@ impl ShardIndex {
 
     #[pyo3(signature = ())]
     pub fn start_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
-        let gc_db_lock = self.gc_db.read().unwrap();
-        if gc_db_lock.is_none() {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized"));
-        }
-        let db = gc_db_lock.as_ref().unwrap();
-        let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
-        let sparse_xorbs = read_txn.open_table(blender::GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
-        
-        if sparse_xorbs.is_empty().unwrap_or(true) {
-            return Ok(false);
-        }
-        
-        drop(read_txn);
-        drop(gc_db_lock);
-        
-        blender::_consolidate_metadata(py, self.sfm.clone(), self.gc_db.clone())?;
-        
-        Ok(true)
+        let has_sparse = py.allow_threads(|| {
+            let gc_db_lock = self.gc_db.read().unwrap();
+            if gc_db_lock.is_none() {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized"));
+            }
+            let db = gc_db_lock.as_ref().unwrap();
+            let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+            let sparse_xorbs = read_txn.open_table(blender::GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
+            
+            if sparse_xorbs.is_empty().unwrap_or(true) {
+                return Ok(false);
+            }
+            
+            drop(read_txn);
+            drop(gc_db_lock);
+            
+            blender::_consolidate_metadata(self.sfm.clone(), self.gc_db.clone())?;
+            Ok(true)
+        })?;
+        Ok(has_sparse)
     }
 
     #[pyo3(signature = ())]
     pub fn stage_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
-        blender::_stage_gc_transaction(py)?;
+        py.allow_threads(|| {
+            blender::_stage_gc_transaction()?;
+            Ok::<_, pyo3::PyErr>(())
+        })?;
         Ok(true)
     }
 
     #[pyo3(signature = ())]
     pub fn verify_gc_transaction(&self, py: Python<'_>) -> PyResult<usize> {
-        let missing = blender::_verify_gc_transaction(py, self.sfm.clone(), self.gc_db.clone())?;
+        let missing = py.allow_threads(|| {
+            blender::_verify_gc_transaction(self.sfm.clone(), self.gc_db.clone())
+        })?;
         Ok(missing)
     }
 
     #[pyo3(signature = ())]
     pub fn commit_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
-        blender::_commit_gc_transaction(py)?;
+        py.allow_threads(|| {
+            blender::_commit_gc_transaction()?;
+            Ok::<_, pyo3::PyErr>(())
+        })?;
         Ok(true)
     }
 
     #[pyo3(signature = ())]
     pub fn revert_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
-        blender::_revert_gc_transaction(py)?;
+        py.allow_threads(|| {
+            blender::_revert_gc_transaction()?;
+            Ok::<_, pyo3::PyErr>(())
+        })?;
         Ok(true)
     }
 
     #[pyo3(signature = ())]
     pub fn prune_garbage(&self, py: Python<'_>) -> PyResult<bool> {
-        blender::_prune_garbage(py)?;
+        py.allow_threads(|| {
+            blender::_prune_garbage()?;
+            Ok::<_, pyo3::PyErr>(())
+        })?;
         Ok(true)
     }
 
@@ -815,6 +831,7 @@ impl ShardIndex {
 
     #[pyo3(signature = (sparse_threshold=30.0))]
     pub fn run_global_utilization_analysis(&self, _py: Python<'_>, sparse_threshold: f64) -> PyResult<()> {
+        _py.allow_threads(|| {
         let gc_db_lock = self.gc_db.read().unwrap();
         let gc_db = match &*gc_db_lock {
             Some(db) => db,
@@ -900,6 +917,8 @@ impl ShardIndex {
         // Flush any remaining entries
         flush_utilization(&mut util_entries, &mut sparse_entries)?;
 
+        Ok::<_, pyo3::PyErr>(())
+        })?;
         Ok(())
     }
 
