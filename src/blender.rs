@@ -9,6 +9,24 @@ use aws_sdk_s3::Client;
 use aws_config::Region;
 use aws_sdk_s3::config::Credentials;
 
+macro_rules! s3_retry {
+    ($max_attempts:expr, $block:block) => {{
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match $block.await {
+                Ok(val) => break Ok(val),
+                Err(e) => {
+                    if attempts >= $max_attempts {
+                        break Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
+                }
+            }
+        }
+    }};
+}
+
 use mdb_shard::merklehash::{MerkleHash, compute_data_hash};
 use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
 use mdb_shard::metadata_shard::streaming_shard::MDBMinimalShard;
@@ -124,12 +142,13 @@ pub fn _consolidate_metadata(
         // Stream XORB natively
         rt.block_on(async {
             let key = format!("gc_consolidated/xorbs/{}", new_xorb_hash_str);
-            client.put_object()
-                .bucket(&bucket)
-                .key(&key)
-                .body(aws_sdk_s3::primitives::ByteStream::from(xorb_new_full))
-                .send().await
-                .map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
+            s3_retry!(5, {
+                client.put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(xorb_new_full.clone()))
+                    .send()
+            }).map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
 
@@ -303,12 +322,13 @@ pub fn _consolidate_metadata(
         
         rt.block_on(async {
             let key = format!("gc_consolidated/shards/{}.mdb", new_shard_hash_str);
-            client.put_object()
-                .bucket(&bucket)
-                .key(&key)
-                .body(aws_sdk_s3::primitives::ByteStream::from(shard_bytes))
-                .send().await
-                .map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
+            s3_retry!(5, {
+                client.put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(shard_bytes.clone()))
+                    .send()
+            }).map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
         
@@ -449,14 +469,14 @@ pub fn _consolidate_metadata(
     // Stream the final REDB lock file up to S3
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await
-            .map_err(|e| format!("Failed to read lock file: {:?}", e))?;
-        client.put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(body)
-            .send().await
-            .map_err(|e| format!("Failed to put active_transaction.redb: {:?}", e))?;
+        s3_retry!(5, {
+            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            client.put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(body)
+                .send()
+        }).map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
@@ -658,8 +678,10 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
-        client.put_object().bucket(&bucket).key(key).body(body).send().await.unwrap();
+        s3_retry!(5, {
+            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            client.put_object().bucket(&bucket).key(key).body(body).send()
+        }).unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -932,8 +954,10 @@ pub fn _verify_gc_transaction(
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
-        client.put_object().bucket(&bucket).key(key).body(body).send().await.unwrap();
+        s3_retry!(5, {
+            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            client.put_object().bucket(&bucket).key(key).body(body).send()
+        }).unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -975,8 +999,10 @@ pub fn _commit_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
-        client.put_object().bucket(&bucket).key(key).body(body).send().await.unwrap();
+        s3_retry!(5, {
+            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            client.put_object().bucket(&bucket).key(key).body(body).send()
+        }).unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -1077,8 +1103,10 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
-        client.put_object().bucket(&bucket).key(key).body(body).send().await.unwrap();
+        s3_retry!(5, {
+            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            client.put_object().bucket(&bucket).key(key).body(body).send()
+        }).unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
