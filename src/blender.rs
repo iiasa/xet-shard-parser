@@ -473,8 +473,10 @@ fn _setup_s3_client() -> PyResult<(Client, String)> {
     let bucket = std::env::var("XET_CAS_S3_BUCKET_NAME").unwrap_or_else(|_| "xet-cas".to_string());
 
     let credentials = Credentials::new(access_key, secret_key, None, None, "xet_janitor");
+    let retry_config = aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(5);
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(aws_config::BehaviorVersion::latest())
+        .retry_config(retry_config)
         .credentials_provider(credentials)
         .region(aws_config::Region::new(region))
         .endpoint_url(&endpoint)
