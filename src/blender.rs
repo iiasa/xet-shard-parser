@@ -469,9 +469,7 @@ pub fn _consolidate_metadata(
     // Stream the final REDB lock file up to S3
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let file_data = std::fs::read(std::path::Path::new(txn_path))
-            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
@@ -480,7 +478,7 @@ pub fn _consolidate_metadata(
     Ok(())
 }
 
-async fn upload_file_reqwest_http1(client: &Client, bucket: &str, key: &str, file_data: Vec<u8>) -> Result<(), String> {
+async fn upload_file_reqwest_http1(client: &Client, bucket: &str, key: &str, file_path: &str) -> Result<(), String> {
     let presigned = client
         .put_object()
         .bucket(bucket)
@@ -498,7 +496,17 @@ async fn upload_file_reqwest_http1(client: &Client, bucket: &str, key: &str, fil
     let mut attempts = 0;
     loop {
         attempts += 1;
-        match reqwest_client.put(presigned.uri().to_string()).body(file_data.clone()).send().await {
+        
+        let file = tokio::fs::File::open(file_path).await.map_err(|e| format!("Failed to open file: {:?}", e))?;
+        let meta = file.metadata().await.map_err(|e| format!("Failed to read meta: {:?}", e))?;
+        let size = meta.len();
+        let body = reqwest::Body::from(file);
+        
+        let request = reqwest_client.put(presigned.uri().to_string())
+            .header("Content-Length", size.to_string())
+            .body(body);
+            
+        match request.send().await {
             Ok(r) if r.status().is_success() => return Ok(()),
             Ok(r) => {
                 let status = r.status();
@@ -711,9 +719,7 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let file_data = std::fs::read(std::path::Path::new(txn_path))
-            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -986,9 +992,7 @@ pub fn _verify_gc_transaction(
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let file_data = std::fs::read(std::path::Path::new(txn_path))
-            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -1030,9 +1034,7 @@ pub fn _commit_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let file_data = std::fs::read(std::path::Path::new(txn_path))
-            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -1133,9 +1135,7 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let file_data = std::fs::read(std::path::Path::new(txn_path))
-            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
