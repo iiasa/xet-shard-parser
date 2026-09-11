@@ -470,7 +470,9 @@ pub fn _consolidate_metadata(
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
         s3_retry!(5, {
-            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            let file_data = std::fs::read(std::path::Path::new(txn_path))
+                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
             client.put_object()
                 .bucket(&bucket)
                 .key(key)
@@ -679,7 +681,9 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
         s3_retry!(5, {
-            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            let file_data = std::fs::read(std::path::Path::new(txn_path))
+                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
             client.put_object().bucket(&bucket).key(key).body(body).send()
         }).unwrap();
         Ok::<_, String>(())
@@ -955,7 +959,9 @@ pub fn _verify_gc_transaction(
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
         s3_retry!(5, {
-            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            let file_data = std::fs::read(std::path::Path::new(txn_path))
+                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
             client.put_object().bucket(&bucket).key(key).body(body).send()
         }).unwrap();
         Ok::<_, String>(())
@@ -1000,7 +1006,9 @@ pub fn _commit_gc_transaction() -> PyResult<()> {
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
         s3_retry!(5, {
-            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            let file_data = std::fs::read(std::path::Path::new(txn_path))
+                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
             client.put_object().bucket(&bucket).key(key).body(body).send()
         }).unwrap();
         Ok::<_, String>(())
@@ -1104,7 +1112,9 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
         s3_retry!(5, {
-            let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(txn_path)).await.unwrap();
+            let file_data = std::fs::read(std::path::Path::new(txn_path))
+                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
             client.put_object().bucket(&bucket).key(key).body(body).send()
         }).unwrap();
         Ok::<_, String>(())
