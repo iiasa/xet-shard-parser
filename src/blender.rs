@@ -469,22 +469,53 @@ pub fn _consolidate_metadata(
     // Stream the final REDB lock file up to S3
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        s3_retry!(5, {
-            let file_data = std::fs::read(std::path::Path::new(txn_path))
-                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
-            client.put_object()
-                .bucket(&bucket)
-                .key(key)
-                .body(body)
-                .send()
-        }).map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
+        let file_data = std::fs::read(std::path::Path::new(txn_path))
+            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
 
     Ok(())
+}
+
+async fn upload_file_reqwest_http1(client: &Client, bucket: &str, key: &str, file_data: Vec<u8>) -> Result<(), String> {
+    let presigned = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .presigned(aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(300)).map_err(|e| format!("{:?}", e))?)
+        .await
+        .map_err(|e| format!("Presigning failed for {}: {:?}", key, e))?;
+        
+    let reqwest_client = ReqwestClient::builder()
+        .http1_only()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| format!("Reqwest init failed: {:?}", e))?;
+        
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match reqwest_client.put(presigned.uri().to_string()).body(file_data.clone()).send().await {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                let err = format!("HTTP {}: {}", status, text);
+                if attempts >= 5 {
+                    return Err(format!("Failed to put {}: {}", key, err));
+                }
+            }
+            Err(e) => {
+                if attempts >= 5 {
+                    return Err(format!("Reqwest error putting {}: {:?}", key, e));
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
+    }
 }
 
 fn _setup_s3_client() -> PyResult<(Client, String)> {
@@ -680,12 +711,9 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        s3_retry!(5, {
-            let file_data = std::fs::read(std::path::Path::new(txn_path))
-                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
-            client.put_object().bucket(&bucket).key(key).body(body).send()
-        }).unwrap();
+        let file_data = std::fs::read(std::path::Path::new(txn_path))
+            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -958,12 +986,9 @@ pub fn _verify_gc_transaction(
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        s3_retry!(5, {
-            let file_data = std::fs::read(std::path::Path::new(txn_path))
-                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
-            client.put_object().bucket(&bucket).key(key).body(body).send()
-        }).unwrap();
+        let file_data = std::fs::read(std::path::Path::new(txn_path))
+            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -1005,12 +1030,9 @@ pub fn _commit_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        s3_retry!(5, {
-            let file_data = std::fs::read(std::path::Path::new(txn_path))
-                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
-            client.put_object().bucket(&bucket).key(key).body(body).send()
-        }).unwrap();
+        let file_data = std::fs::read(std::path::Path::new(txn_path))
+            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
@@ -1111,12 +1133,9 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        s3_retry!(5, {
-            let file_data = std::fs::read(std::path::Path::new(txn_path))
-                .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
-            let body = aws_sdk_s3::primitives::ByteStream::from(file_data);
-            client.put_object().bucket(&bucket).key(key).body(body).send()
-        }).unwrap();
+        let file_data = std::fs::read(std::path::Path::new(txn_path))
+            .map_err(|e| format!("Failed to read {}: {:?}", txn_path, e)).unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, file_data).await.unwrap();
         Ok::<_, String>(())
     }).unwrap();
     
