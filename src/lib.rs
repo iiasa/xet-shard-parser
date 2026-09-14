@@ -26,7 +26,24 @@ const GC_XORB_CHUNKS_TABLE: redb::TableDefinition<&[u8; 32], &[u8]> = redb::Tabl
 
 fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
     let mut reader = Cursor::new(bytes);
-    let xorb_obj = XorbObject::deserialize(&mut reader).ok()?;
+    
+    // Debug info_length
+    if bytes.len() >= 4 {
+        let mut info_length = [0u8; 4];
+        info_length.copy_from_slice(&bytes[bytes.len()-4..]);
+        let info_len_u32 = u32::from_le_bytes(info_length);
+        
+        let last_16 = if bytes.len() >= 16 { &bytes[bytes.len()-16..] } else { bytes };
+        eprintln!("DEBUG: parse_xorb_footer_data: info_length = {}, bytes.len() = {}, last_16_bytes = {:?}", info_len_u32, bytes.len(), last_16);
+    }
+
+    let xorb_obj = match XorbObject::deserialize(&mut reader) {
+        Ok(obj) => obj,
+        Err(e) => {
+            eprintln!("DEBUG: XorbObject::deserialize failed: {:?}", e);
+            return None;
+        }
+    };
     let info = xorb_obj.info;
     Some((info.chunk_hashes, info.chunk_boundary_offsets, info.unpacked_chunk_offsets))
 }
@@ -44,7 +61,7 @@ pub struct ShardIndex {
 #[pymethods]
 impl ShardIndex {
     #[new]
-    pub fn new(cache_dir: String, db_path: String, max_cache_size: Option<u64>) -> PyResult<Self> {
+    pub fn new(py: Python<'_>, cache_dir: String, db_path: String, max_cache_size: Option<u64>) -> PyResult<Self> {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create tokio runtime: {e}")))?;
         
@@ -75,96 +92,101 @@ impl ShardIndex {
         };
 
         // Trigger an initial refresh with the size limit
-        index.refresh(max_cache_size)?;
+        index.refresh(py, max_cache_size)?;
 
         Ok(index)
     }
 
-    pub fn get_all_shard_xorbs(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let shards = self.rt.block_on(async {
-            self.sfm.registered_shard_list().await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
+    pub fn get_all_shard_xorbs<'a>(&self, py: Python<'a>) -> PyResult<&'a PyAny> {
+        let sfm = self.sfm.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let shards = sfm.registered_shard_list().await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
 
-        let dict = PyDict::new(py);
-
-        for shard_file in shards {
-            let mut reader = match shard_file.get_reader() {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            
-            let m_shard = match MDBMinimalShard::from_reader(&mut reader, false, true) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            
-            let xorbs_list = PyList::empty(py);
-            for i in 0..m_shard.num_xorb() {
-                if let Some(xiv) = m_shard.xorb(i) {
-                    let h_hex = xiv.xorb_hash().hex();
-                    let _ = xorbs_list.append(h_hex);
+            Python::with_gil(|py| {
+                let dict = PyDict::new(py);
+                for shard_file in shards {
+                    let mut reader = match shard_file.get_reader() {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    
+                    let m_shard = match MDBMinimalShard::from_reader(&mut reader, false, true) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    
+                    let xorbs_list = PyList::empty(py);
+                    for i in 0..m_shard.num_xorb() {
+                        if let Some(xiv) = m_shard.xorb(i) {
+                            let h_hex = xiv.xorb_hash().hex();
+                            let _ = xorbs_list.append(h_hex);
+                        }
+                    }
+                    let _ = dict.set_item(shard_file.shard_hash.hex(), xorbs_list);
                 }
-            }
-            let _ = dict.set_item(shard_file.shard_hash.hex(), xorbs_list);
-        }
-
-        Ok(dict.into())
+                let obj: PyObject = dict.into();
+                Ok(obj)
+            })
+        })
     }
 
     #[pyo3(signature = (file_hash_hex))]
-    pub fn get_file_size(&self, _py: Python<'_>, file_hash_hex: &str) -> PyResult<Option<u64>> {
-        let h = MerkleHash::from_hex(file_hash_hex)
+    pub fn get_file_size<'a>(&self, py: Python<'a>, file_hash_hex: String) -> PyResult<&'a PyAny> {
+        let h = MerkleHash::from_hex(&file_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+        let sfm = self.sfm.clone();
         
-        let res = self.rt.block_on(async {
-            self.sfm.get_file_reconstruction_info(&h).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed: {e:?}")))?;
-        
-        if let Some((file_info, _)) = res {
-            Ok(Some(file_info.file_size() as u64))
-        } else {
-            Ok(None)
-        }
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let res = sfm.get_file_reconstruction_info(&h).await;
+            if let Ok(Some((file_info, _))) = res {
+                Ok::<_, pyo3::PyErr>(Some(file_info.file_size() as u64))
+            } else {
+                Ok::<_, pyo3::PyErr>(None)
+            }
+        })
     }
 
     #[pyo3(signature = (xorb_hashes))]
-    pub fn get_shards_for_xorbs(&self, _py: Python<'_>, xorb_hashes: Vec<String>) -> PyResult<std::collections::HashSet<String>> {
+    pub fn get_shards_for_xorbs<'a>(&self, py: Python<'a>, xorb_hashes: Vec<String>) -> PyResult<&'a PyAny> {
         let mut target_xorbs: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         for hex in xorb_hashes {
             if let Ok(mh) = MerkleHash::from_hex(&hex) {
                 target_xorbs.insert(mh.into());
             }
         }
+        let sfm = self.sfm.clone();
         
-        let shards = self.rt.block_on(async {
-            self.sfm.registered_shard_list().await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let shards = sfm.registered_shard_list().await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
 
-        let mut matching_shards = std::collections::HashSet::new();
+            let mut matching_shards = std::collections::HashSet::new();
 
-        for shard_file in shards {
-            let mut reader = match shard_file.get_reader() {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            
-            let m_shard = match MDBMinimalShard::from_reader(&mut reader, false, true) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            
-            for i in 0..m_shard.num_xorb() {
-                if let Some(xiv) = m_shard.xorb(i) {
-                    let h: [u8; 32] = xiv.xorb_hash().into();
-                    if target_xorbs.contains(&h) {
-                        matching_shards.insert(shard_file.shard_hash.hex());
-                        break;
+            for shard_file in shards {
+                let mut reader = match shard_file.get_reader() {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                
+                let m_shard = match MDBMinimalShard::from_reader(&mut reader, false, true) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                
+                for i in 0..m_shard.num_xorb() {
+                    if let Some(xiv) = m_shard.xorb(i) {
+                        let h: [u8; 32] = xiv.xorb_hash().into();
+                        if target_xorbs.contains(&h) {
+                            matching_shards.insert(shard_file.shard_hash.hex());
+                            break;
+                        }
                     }
                 }
             }
-        }
 
-        Ok(matching_shards)
+            Ok::<_, pyo3::PyErr>(matching_shards)
+        })
     }
 
 
@@ -237,44 +259,50 @@ impl ShardIndex {
         Ok(true)
     }
 
-    pub fn prune_shard(&self, shard_hash_hex: &str) -> PyResult<()> {
+    pub fn prune_shard(&self, py: Python<'_>, shard_hash_hex: &str) -> PyResult<()> {
         let h = MerkleHash::from_hex(shard_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
         let h_bytes: [u8; 32] = h.into();
 
-        let write_txn = self.db.begin_write()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
-        {
-            let mut table = match write_txn.open_table(GLOBAL_DEDUP_TABLE) {
-                Ok(t) => t,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
-            };
-            
-            let mut to_delete = Vec::new();
-            for entry in table.iter().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))? {
-                let (k, v) = entry.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-                if v.value() == &h_bytes {
-                    to_delete.push(*k.value());
+        py.allow_threads(|| {
+            let write_txn = self.db.begin_write()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+            {
+                let mut table = match write_txn.open_table(GLOBAL_DEDUP_TABLE) {
+                    Ok(t) => t,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                    Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
+                };
+                
+                let mut to_delete = Vec::new();
+                for entry in table.iter().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))? {
+                    let (k, v) = entry.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                    if v.value() == &h_bytes {
+                        to_delete.push(*k.value());
+                    }
+                }
+
+                for k in to_delete {
+                    table.remove(&k)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Remove failed: {e}")))?;
                 }
             }
-
-            for k in to_delete {
-                table.remove(&k)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Remove failed: {e}")))?;
-            }
-        }
-        write_txn.commit()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+            write_txn.commit()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+            Ok::<(), PyErr>(())
+        })?;
 
         Ok(())
     }
 
-    pub fn register_shard(&self, shard_bytes: &[u8], shard_hash_hex: Option<String>) -> PyResult<()> {
-        // 1. Register with ShardFileManager (persists .sib to disk and indexes in memory)
-        self.rt.block_on(async {
-            self.sfm.import_shard_from_bytes(shard_bytes).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to import shard: {e:?}")))?;
+    pub fn register_shard(&self, py: Python<'_>, shard_bytes: &[u8], shard_hash_hex: Option<String>) -> PyResult<()> {
+        py.allow_threads(|| {
+            // 1. Register with ShardFileManager (persists .sib to disk and indexes in memory)
+            self.rt.block_on(async {
+                self.sfm.import_shard_from_bytes(shard_bytes).await
+            }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to import shard: {e:?}")))?;
+            Ok::<(), PyErr>(())
+        })?;
 
         // 2. Index global deduplication chunks in redb
         let mut cursor = Cursor::new(shard_bytes);
@@ -289,34 +317,37 @@ impl ShardIndex {
         };
         let shard_hash_bytes: [u8; 32] = shard_hash.into();
 
-        let write_txn = self.db.begin_write()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
-        {
-            let mut table = write_txn.open_table(GLOBAL_DEDUP_TABLE)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
-            
-            for chunk_hash in shard.global_dedup_eligible_chunks() {
-                let chunk_hash_bytes: [u8; 32] = chunk_hash.into();
-                table.insert(&chunk_hash_bytes, &shard_hash_bytes)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert failed: {e}")))?;
+        py.allow_threads(|| {
+            let write_txn = self.db.begin_write()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+            {
+                let mut table = write_txn.open_table(GLOBAL_DEDUP_TABLE)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+                
+                for chunk_hash in shard.global_dedup_eligible_chunks() {
+                    let chunk_hash_bytes: [u8; 32] = chunk_hash.into();
+                    table.insert(&chunk_hash_bytes, &shard_hash_bytes)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert failed: {e}")))?;
+                }
             }
-        }
-        write_txn.commit()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+            write_txn.commit()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
+            Ok::<(), PyErr>(())
+        })?;
 
         Ok(())
     }
 
     #[pyo3(signature = (file_hash_hex, start_byte=None, end_byte=None, footers=None, coalesce=None))]
-    pub fn calculate_reconstruction(
+    pub fn calculate_reconstruction<'a>(
         &self,
-        py: Python<'_>,
-        file_hash_hex: &str,
+        py: Python<'a>,
+        file_hash_hex: String,
         start_byte: Option<u64>,
         end_byte: Option<u64>,
         footers: Option<&PyDict>,
         coalesce: Option<bool>,
-    ) -> PyResult<Option<Py<PyDict>>> {
+    ) -> PyResult<&'a PyAny> {
         let mut xorb_footers = std::collections::HashMap::new();
         
         if let Some(footers) = footers {
@@ -334,68 +365,84 @@ impl ShardIndex {
             }
         }
 
-        self.calculate_reconstruction_internal(py, file_hash_hex, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true))
+        let h = MerkleHash::from_hex(&file_hash_hex)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+            
+        let sfm = self.sfm.clone();
+        
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let res = sfm.get_file_reconstruction_info(&h).await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed: {e:?}")))?;
+            
+            let (file_info, _) = match res {
+                Some(r) => r,
+                None => return Ok(Python::with_gil(|py| py.None().into_ref(py).to_object(py))),
+            };
+            
+            Python::with_gil(|py| {
+                Self::calculate_reconstruction_internal_sync(py, &file_hash_hex, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true), file_info)
+                    .map(|r| match r {
+                        Some(dict) => dict.to_object(py),
+                        None => py.None().into_ref(py).to_object(py),
+                    })
+            })
+        })
     }
 
     #[pyo3(signature = (file_hash_hex, start_byte, end_byte, xorb_urls, coalesce=None))]
-    pub fn calculate_reconstruction_with_urls(
+    pub fn calculate_reconstruction_with_urls<'a>(
         &self,
-        py: Python<'_>,
-        file_hash_hex: &str,
+        py: Python<'a>,
+        file_hash_hex: String,
         start_byte: Option<u64>,
         end_byte: Option<u64>,
-        xorb_urls: &PyDict,
+        xorb_urls: std::collections::HashMap<String, String>,
         coalesce: Option<bool>,
-    ) -> PyResult<Option<Py<PyDict>>> {
-        let h = MerkleHash::from_hex(file_hash_hex)
+    ) -> PyResult<&'a PyAny> {
+        let h = MerkleHash::from_hex(&file_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
+        let sfm = self.sfm.clone();
+        let client = self.client.clone();
+        let sfm2 = self.sfm.clone(); // For calculate_reconstruction_internal
 
-        let res = self.rt.block_on(async {
-            self.sfm.get_file_reconstruction_info(&h).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed: {e:?}")))?;
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let res = sfm.get_file_reconstruction_info(&h).await;
 
-        let (file_info, _) = match res {
-            Some(r) => r,
-            None => return Ok(None),
-        };
+            let (file_info, _) = match res {
+                Ok(Some(r)) => r,
+                _ => return Ok::<_, pyo3::PyErr>(None),
+            };
 
-        // Determine which XORBs are needed for the requested range
-        let total_file_size = file_info.file_size();
-        let file_range_start = start_byte.unwrap_or(0);
-        let file_range_end = end_byte.unwrap_or(total_file_size).min(total_file_size);
+            // Determine which XORBs are needed for the requested range
+            let total_file_size = file_info.file_size();
+            let file_range_start = start_byte.unwrap_or(0);
+            let file_range_end = end_byte.unwrap_or(total_file_size).min(total_file_size);
 
-        let mut cumulative_bytes = 0u64;
-        let mut needed_xorbs = std::collections::HashSet::new();
-        for segment in &file_info.segments {
-            let n = segment.unpacked_segment_bytes as u64;
-            if cumulative_bytes + n > file_range_start && cumulative_bytes <= file_range_end {
-                needed_xorbs.insert(segment.xorb_hash);
+            let mut cumulative_bytes = 0u64;
+            let mut needed_xorbs = std::collections::HashSet::new();
+            for segment in &file_info.segments {
+                let n = segment.unpacked_segment_bytes as u64;
+                if cumulative_bytes + n > file_range_start && cumulative_bytes <= file_range_end {
+                    needed_xorbs.insert(segment.xorb_hash);
+                }
+                cumulative_bytes += n;
             }
-            cumulative_bytes += n;
-        }
 
-        // Concurrently fetch footers for required XORBs
-        let mut xorb_footers = std::collections::HashMap::new();
-        let mut fetch_tasks = Vec::new();
+            // Concurrently fetch footers for required XORBs
+            let mut xorb_footers = std::collections::HashMap::new();
+            let mut fetch_tasks = Vec::new();
 
-        for xh in needed_xorbs {
-            let xh_hex = xh.hex();
-            let mut found = false;
-            if let Ok(Some(url_obj)) = xorb_urls.get_item(&xh_hex) {
-                if let Ok(url) = url_obj.extract::<String>() {
-                    fetch_tasks.push((xh, url));
-                    found = true;
+            for xh in &needed_xorbs {
+                let xh_hex = xh.hex();
+                if let Some(url) = xorb_urls.get(&xh_hex) {
+                    fetch_tasks.push((xh.clone(), url.clone()));
+                } else {
+                    xorb_footers.insert(xh.clone(), None);
                 }
             }
-            if !found {
-                xorb_footers.insert(xh, None);
-            }
-        }
 
-        if !fetch_tasks.is_empty() {
-            let footers_res = self.rt.block_on(async {
-                let client = self.client.clone();
-
+            eprintln!("DEBUG: needed_xorbs count: {}, fetch_tasks count: {}, xorb_urls count: {}", needed_xorbs.len(), fetch_tasks.len(), xorb_urls.len());
+            if !fetch_tasks.is_empty() {
                 let results: Vec<(MerkleHash, Option<Vec<u8>>)> = futures::stream::iter(fetch_tasks)
                     .map(|(xh, url)| {
                         let client = client.clone();
@@ -408,59 +455,96 @@ impl ShardIndex {
                             
                             match resp {
                                 Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
-                                    let bytes = r.bytes().await.ok().map(|b| b.to_vec());
-                                    (xh, bytes)
+                                    let bytes_res = r.bytes().await;
+                                    match bytes_res {
+                                        Ok(b) => (xh, Some(b.to_vec())),
+                                        Err(e) => {
+                                            eprintln!("DEBUG: r.bytes().await failed for xh: {} with error: {}", xh.hex(), e);
+                                            (xh, None)
+                                        }
+                                    }
                                 }
-                                _ => (xh, None),
+                                Ok(r) => {
+                                    eprintln!("Footer fetch for {} failed with status: {}", xh.hex(), r.status());
+                                    (xh, None)
+                                }
+                                Err(e) => {
+                                    eprintln!("Footer fetch for {} failed with error: {}", xh.hex(), e);
+                                    (xh, None)
+                                }
                             }
                         }
                     })
                     .buffer_unordered(10)
                     .collect()
                     .await;
-                
-                Ok::<Vec<(MerkleHash, Option<Vec<u8>>)>, String>(results)
-            }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
 
-            for (xh, bytes_opt) in footers_res {
-                let footer = bytes_opt.and_then(|bytes| parse_xorb_footer_data(&bytes));
-                xorb_footers.insert(xh, footer);
+                for (xh, bytes_opt) in results {
+                    let footer = match bytes_opt {
+                        Some(bytes) => {
+                            let parsed = parse_xorb_footer_data(&bytes);
+                            if parsed.is_none() {
+                                eprintln!("DEBUG: parse_xorb_footer_data failed for xh: {}, bytes length: {}", xh.hex(), bytes.len());
+                            }
+                            parsed
+                        }
+                        None => {
+                            eprintln!("DEBUG: bytes_opt is None for xh: {} (perhaps r.bytes().await failed?)", xh.hex());
+                            None
+                        }
+                    };
+                    xorb_footers.insert(xh, footer);
+                }
             }
-        }
 
-        self.calculate_reconstruction_internal(py, file_hash_hex, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true))
+            // Inline the internal reconstruction logic here to avoid GIL lifetime issues!
+            let res2 = sfm2.get_file_reconstruction_info(&h).await;
+            let (file_info2, _) = match res2 {
+                Ok(Some(r)) => r,
+                _ => return Ok::<_, pyo3::PyErr>(None),
+            };
+            
+            Python::with_gil(|py| {
+                // Here we just call a purely synchronous helper function without blocking!
+                crate::ShardIndex::calculate_reconstruction_internal_sync(py, &file_hash_hex, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true), file_info2)
+            })
+        })
     }
 
-    pub fn get_chunk_shard(&self, chunk_hash_hex: &str) -> PyResult<Option<String>> {
+    pub fn get_chunk_shard(&self, py: Python<'_>, chunk_hash_hex: &str) -> PyResult<Option<String>> {
         let h = MerkleHash::from_hex(chunk_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
         let h_bytes: [u8; 32] = h.into();
 
-        let read_txn = self.db.begin_read()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
-        let table = match read_txn.open_table(GLOBAL_DEDUP_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
-        };
-        
-        let res = table.get(&h_bytes)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+        py.allow_threads(|| {
+            let read_txn = self.db.begin_read()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+            let table = match read_txn.open_table(GLOBAL_DEDUP_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
+            };
+            
+            let res = table.get(&h_bytes)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
 
-        if let Some(shard_hash_bytes) = res {
-            let shard_hash = MerkleHash::from(*shard_hash_bytes.value());
-            return Ok(Some(shard_hash.hex()));
-        }
+            if let Some(shard_hash_bytes) = res {
+                let shard_hash = MerkleHash::from(*shard_hash_bytes.value());
+                return Ok(Some(shard_hash.hex()));
+            }
 
-        Ok(None)
+            Ok(None)
+        })
     }
 
     pub fn get_xorb_layout(&self, py: Python<'_>, xorb_hash_hex: &str) -> PyResult<Option<Py<PyList>>> {
         let h = MerkleHash::from_hex(xorb_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
 
-        let shards = self.rt.block_on(async {
-            self.sfm.registered_shard_list().await
+        let shards = py.allow_threads(|| {
+            self.rt.block_on(async {
+                self.sfm.registered_shard_list().await
+            })
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
 
         for shard_file in shards {
@@ -499,24 +583,21 @@ impl ShardIndex {
         Ok(None)
     }
 
-    pub fn refresh(&self, max_cache_size: Option<u64>) -> PyResult<()> {
+    pub fn refresh(&self, py: Python<'_>, max_cache_size: Option<u64>) -> PyResult<()> {
         let prune_size = max_cache_size.unwrap_or(0);
-        self.rt.block_on(async {
-            self.sfm.refresh_shard_dir(false, prune_size).await
+        py.allow_threads(|| {
+            self.rt.block_on(async {
+                self.sfm.refresh_shard_dir(false, prune_size).await
+            })
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Refresh failed: {e:?}")))?;
         Ok(())
     }
 
     #[pyo3(signature = (tasks))]
-    pub fn reconstruct_file_parallel(
-        &self,
-        py: Python<'_>,
-        tasks: &PyList,
-    ) -> PyResult<PyObject> {
-        // tasks is a list of (url, byte_start, byte_end, unpacked_size)
-        let mut fetch_tasks = Vec::new();
-        let mut total_size = 0;
-
+    pub fn reconstruct_file_parallel<'a>(&self, py: Python<'a>, tasks: &PyList) -> PyResult<&'a PyAny> {
+        let mut fetch_tasks: Vec<(String, u64, u64, u32)> = Vec::new();
+        let mut total_size = 0usize;
+        
         for item in tasks.iter() {
             let task_tuple: (String, u64, u64, u32) = item.extract()?;
             total_size += task_tuple.3 as usize;
@@ -524,15 +605,17 @@ impl ShardIndex {
         }
 
         if fetch_tasks.is_empty() {
-            return Ok(PyBytes::new(py, &[]).into());
+            return pyo3_asyncio::tokio::future_into_py(py, async move {
+                Python::with_gil(|py| {
+                    let obj: PyObject = pyo3::types::PyBytes::new(py, &[]).into();
+                    Ok::<_, pyo3::PyErr>(obj)
+                })
+            });
         }
 
-        let mut output_buffer = vec![0u8; total_size];
+        let client = self.client.clone();
 
-        py.allow_threads(|| {
-            self.rt.block_on(async {
-                let client = self.client.clone();
-            
+        pyo3_asyncio::tokio::future_into_py(py, async move {
             let mut results: Vec<Result<Vec<u8>, String>> = Vec::new();
             if !fetch_tasks.is_empty() {
                 results = futures::stream::iter(fetch_tasks)
@@ -559,39 +642,33 @@ impl ShardIndex {
                                     .map_err(|e| format!("Decompression failed: {:?}", e))?;
                                 total_unpacked += unpacked_len;
                             }
-                            
-                            Ok::<Vec<u8>, String>(decompressed)
+                            Ok(decompressed)
                         }
                     })
-                    .buffered(16) // Limit concurrency to 16 requests per batch
-                    .collect::<Vec<_>>()
+                    .buffered(32) // Limit concurrency to 32 requests per batch
+                    .collect::<Vec<Result<Vec<u8>, String>>>()
                     .await;
             }
-            
-            let mut final_offset = 0;
-            for res in results {
-                match res {
-                    Ok(data) => {
-                        let len = data.len().min(total_size - final_offset);
-                        if len > 0 {
-                            output_buffer[final_offset..final_offset + len].copy_from_slice(&data[..len]);
-                            final_offset += len;
-                        }
-                    }
-                    Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
-                }
-            }
-            
-            Ok::<(), PyErr>(())
-        })
-        })?;
 
-        let bytes = PyBytes::new(py, &output_buffer);
-        Ok(bytes.into())
+            let mut final_out = vec![0u8; total_size];
+            let mut offset = 0;
+            
+            for res in results {
+                let chunk_bytes = res.map_err(|e| pyo3::PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
+                let chunk_len = chunk_bytes.len();
+                final_out[offset..offset + chunk_len].copy_from_slice(&chunk_bytes);
+                offset += chunk_len;
+            }
+
+            Python::with_gil(|py| {
+                let obj: PyObject = pyo3::types::PyBytes::new(py, &final_out).into();
+                Ok::<_, pyo3::PyErr>(obj)
+            })
+        })
     }
 
     #[pyo3(signature = (gc_db_path=None))]
-    pub fn init_gc(&self, gc_db_path: Option<String>) -> PyResult<()> {
+    pub fn init_gc(&self, py: Python<'_>, gc_db_path: Option<String>) -> PyResult<()> {
         let path = match gc_db_path {
             Some(p) => std::path::PathBuf::from(p),
             None => self.sfm.shard_directory().join("gc_live_chunks.redb"),
@@ -623,8 +700,10 @@ impl ShardIndex {
             let mut xorb_chunks_table = write_txn.open_table(GC_XORB_CHUNKS_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open GC_XORB_CHUNKS_TABLE: {e}")))?;
 
-            let shards = self.rt.block_on(async {
-                self.sfm.registered_shard_list().await
+            let shards = py.allow_threads(|| {
+                self.rt.block_on(async {
+                    self.sfm.registered_shard_list().await
+                })
             }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
 
             for shard_file in shards {
@@ -671,7 +750,7 @@ impl ShardIndex {
     }
 
     #[pyo3(signature = ())]
-    pub fn cleanup_gc(&self) -> PyResult<()> {
+    pub fn cleanup_gc(&self, _py: Python<'_>) -> PyResult<()> {
         *self.gc_db.write().unwrap() = None;
         if let Some(path) = self.gc_db_path.write().unwrap().take() {
             if path.exists() {
@@ -743,8 +822,10 @@ impl ShardIndex {
                     Err(_) => continue,
                 };
 
-                let res = self.rt.block_on(async {
-                    self.sfm.get_file_reconstruction_info(&h).await
+                let res = _py.allow_threads(|| {
+                    self.rt.block_on(async {
+                        self.sfm.get_file_reconstruction_info(&h).await
+                    })
                 }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed for {}: {:?}", file_hash_hex, e)))?;
 
                 let (file_info, _) = match res {
@@ -782,53 +863,57 @@ impl ShardIndex {
     }
 
     #[pyo3(signature = (chunk_hash_hex))]
-    pub fn is_chunk_live(&self, chunk_hash_hex: &str) -> PyResult<bool> {
-        let gc_db_lock = self.gc_db.read().unwrap();
-        let gc_db = match &*gc_db_lock {
-            Some(db) => db,
-            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
-        };
-
+    pub fn is_chunk_live(&self, py: Python<'_>, chunk_hash_hex: &str) -> PyResult<bool> {
         let h = MerkleHash::from_hex(chunk_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
         let h_bytes: [u8; 32] = h.into();
 
-        let read_txn = gc_db.begin_read()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
-        let table = read_txn.open_table(GC_LIVE_CHUNKS_TABLE)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
-        
-        let res = table.get(&h_bytes)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+        py.allow_threads(|| {
+            let gc_db_lock = self.gc_db.read().unwrap();
+            let gc_db = match &*gc_db_lock {
+                Some(db) => db,
+                None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
+            };
 
-        Ok(res.is_some())
+            let read_txn = gc_db.begin_read()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+            let table = read_txn.open_table(GC_LIVE_CHUNKS_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+            
+            let res = table.get(&h_bytes)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+
+            Ok(res.is_some())
+        })
     }
 
     #[pyo3(signature = (chunk_hash_hex))]
-    pub fn get_primary_xorb(&self, chunk_hash_hex: &str) -> PyResult<Option<String>> {
-        let gc_db_lock = self.gc_db.read().unwrap();
-        let gc_db = match &*gc_db_lock {
-            Some(db) => db,
-            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
-        };
-
+    pub fn get_primary_xorb(&self, py: Python<'_>, chunk_hash_hex: &str) -> PyResult<Option<String>> {
         let h = MerkleHash::from_hex(chunk_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
         let h_bytes: [u8; 32] = h.into();
 
-        let read_txn = gc_db.begin_read()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
-        let table = read_txn.open_table(GC_PRIMARY_XORB_TABLE)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
-        
-        let res = table.get(&h_bytes)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+        py.allow_threads(|| {
+            let gc_db_lock = self.gc_db.read().unwrap();
+            let gc_db = match &*gc_db_lock {
+                Some(db) => db,
+                None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
+            };
 
-        if let Some(xorb_hash_bytes) = res {
-            let xorb_hash = MerkleHash::from(*xorb_hash_bytes.value());
-            return Ok(Some(xorb_hash.hex()));
-        }
-        Ok(None)
+            let read_txn = gc_db.begin_read()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+            let table = read_txn.open_table(GC_PRIMARY_XORB_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+            
+            let res = table.get(&h_bytes)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+
+            if let Some(xorb_hash_bytes) = res {
+                let xorb_hash = MerkleHash::from(*xorb_hash_bytes.value());
+                return Ok(Some(xorb_hash.hex()));
+            }
+            Ok(None)
+        })
     }
 
     #[pyo3(signature = (sparse_threshold=30.0))]
@@ -925,33 +1010,35 @@ impl ShardIndex {
     }
 
     #[pyo3(signature = (xorb_hash_hex))]
-    pub fn get_xorb_utilization(&self, xorb_hash_hex: &str) -> PyResult<Option<String>> {
-        let gc_db_lock = self.gc_db.read().unwrap();
-        let gc_db = match &*gc_db_lock {
-            Some(db) => db,
-            None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
-        };
-
+    pub fn get_xorb_utilization(&self, py: Python<'_>, xorb_hash_hex: &str) -> PyResult<Option<String>> {
         let h = MerkleHash::from_hex(xorb_hash_hex)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
         let h_bytes: [u8; 32] = h.into();
 
-        let read_txn = gc_db.begin_read()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
-        let table = match read_txn.open_table(GC_XORB_UTILIZATION_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
-        };
-        
-        let res = table.get(&h_bytes)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+        py.allow_threads(|| {
+            let gc_db_lock = self.gc_db.read().unwrap();
+            let gc_db = match &*gc_db_lock {
+                Some(db) => db,
+                None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
+            };
 
-        if let Some(value) = res {
-            let json_str = value.value().to_string();
-            return Ok(Some(json_str));
-        }
-        Ok(None)
+            let read_txn = gc_db.begin_read()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+            let table = match read_txn.open_table(GC_XORB_UTILIZATION_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}"))),
+            };
+            
+            let res = table.get(&h_bytes)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?;
+
+            if let Some(value) = res {
+                let json_str = value.value().to_string();
+                return Ok(Some(json_str));
+            }
+            Ok(None)
+        })
     }
 
     #[pyo3(signature = ())]
@@ -979,26 +1066,15 @@ impl ShardIndex {
 }
 
 impl ShardIndex {
-    fn calculate_reconstruction_internal(
-        &self,
+    pub fn calculate_reconstruction_internal_sync(
         py: Python<'_>,
         file_hash_hex: &str,
         start_byte: Option<u64>,
         end_byte: Option<u64>,
         xorb_footers: std::collections::HashMap<MerkleHash, Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)>>,
         coalesce: bool,
+        file_info: mdb_shard::metadata_shard::file_structs::MDBFileInfo,
     ) -> PyResult<Option<Py<PyDict>>> {
-        let h = MerkleHash::from_hex(file_hash_hex)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid hex: {e:?}")))?;
-
-        let res = self.rt.block_on(async {
-            self.sfm.get_file_reconstruction_info(&h).await
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed: {e:?}")))?;
-
-        let (file_info, _) = match res {
-            Some(r) => r,
-            None => return Ok(None),
-        };
 
         let total_file_size = file_info.file_size();
         let file_range_start = start_byte.unwrap_or(0);
@@ -1034,7 +1110,7 @@ impl ShardIndex {
             let seg_unpacked_len = segment.unpacked_segment_bytes as u64;
             
             // Intersection check: segment covers [cumulative_bytes, cumulative_bytes + seg_unpacked_len)
-            if cumulative_bytes + seg_unpacked_len > file_range_start && cumulative_bytes < file_range_end {
+            if cumulative_bytes + seg_unpacked_len > file_range_start && cumulative_bytes <= file_range_end {
                 
                 if !first_found {
                     first_chunk_byte_start = cumulative_bytes;
@@ -1157,32 +1233,40 @@ pub fn merge_shards(
 
     use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
 
-    let dest_shards = PyList::empty(py);
-    let mut current_shard = MDBInMemoryShard::default();
+    let dest_shards_bytes = py.allow_threads(|| {
+        let mut dest = Vec::new();
+        let mut current_shard = MDBInMemoryShard::default();
 
-    for data in shard_list {
-        let parsed_shard = bytes_to_in_memory_shard(&data)?;
+        for data in shard_list {
+            let parsed_shard = bytes_to_in_memory_shard(&data)?;
 
-        if current_shard.is_empty() {
-            current_shard = parsed_shard;
-        } else {
-            let candidate = current_shard.union(&parsed_shard)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Union error: {e:?}")))?;
-
-            if candidate.shard_file_size() <= target_max_size {
-                current_shard = candidate;
-            } else {
-                let out_bytes = current_shard.to_bytes()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
-                dest_shards.append(PyBytes::new(py, &out_bytes))?;
+            if current_shard.is_empty() {
                 current_shard = parsed_shard;
+            } else {
+                let candidate = current_shard.union(&parsed_shard)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Union error: {e:?}")))?;
+
+                if candidate.shard_file_size() <= target_max_size {
+                    current_shard = candidate;
+                } else {
+                    let out_bytes = current_shard.to_bytes()
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
+                    dest.push(out_bytes);
+                    current_shard = parsed_shard;
+                }
             }
         }
-    }
 
-    if !current_shard.is_empty() {
-        let out_bytes = current_shard.to_bytes()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
+        if !current_shard.is_empty() {
+            let out_bytes = current_shard.to_bytes()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
+            dest.push(out_bytes);
+        }
+        Ok::<Vec<Vec<u8>>, PyErr>(dest)
+    })?;
+
+    let dest_shards = PyList::empty(py);
+    for out_bytes in dest_shards_bytes {
         dest_shards.append(PyBytes::new(py, &out_bytes))?;
     }
 
@@ -1191,16 +1275,16 @@ pub fn merge_shards(
 
 #[pyfunction]
 pub fn add_footer_to_xorb(py: Python<'_>, xorb_bytes: &[u8]) -> PyResult<PyObject> {
-    let mut output = Vec::new();
-    match reconstruct_xorb_with_footer(&mut output, xorb_bytes) {
-        Ok(_) => {
-            let bytes = pyo3::types::PyBytes::new(py, &output);
-            Ok(bytes.into())
-        },
-        Err(e) => {
-            Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to reconstruct xorb with footer: {:?}", e)))
+    let output = py.allow_threads(|| {
+        let mut output = Vec::new();
+        match reconstruct_xorb_with_footer(&mut output, xorb_bytes) {
+            Ok(_) => Ok(output),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to reconstruct xorb with footer: {:?}", e)))
         }
-    }
+    })?;
+    
+    let bytes = pyo3::types::PyBytes::new(py, &output);
+    Ok(bytes.into())
 }
 
 fn bytes_to_in_memory_shard(shard_bytes: &[u8]) -> PyResult<mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard> {
@@ -1230,19 +1314,29 @@ fn bytes_to_in_memory_shard(shard_bytes: &[u8]) -> PyResult<mdb_shard::metadata_
 }
 
 #[pyfunction]
-pub fn compute_shard_hash(shard_bytes: &[u8]) -> String {
-    compute_data_hash(shard_bytes).hex()
+pub fn compute_shard_hash(py: Python<'_>, shard_bytes: &[u8]) -> String {
+    py.allow_threads(|| {
+        compute_data_hash(shard_bytes).hex()
+    })
 }
 
 #[pyfunction]
 pub fn reconstruct_shard(py: Python<'_>, shard_bytes: &[u8]) -> PyResult<PyObject> {
-    let header = MDBShardFileHeader::deserialize(&mut Cursor::new(shard_bytes))
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse header: {e:?}")))?;
+    let result = py.allow_threads(|| {
+        let header = MDBShardFileHeader::deserialize(&mut Cursor::new(shard_bytes))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse header: {e:?}")))?;
 
-    if header.footer_size == 0 {
-        let in_memory_shard = bytes_to_in_memory_shard(shard_bytes)?;
-        let reconstructed = in_memory_shard.to_bytes()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to serialize in-memory shard: {e:?}")))?;
+        if header.footer_size == 0 {
+            let in_memory_shard = bytes_to_in_memory_shard(shard_bytes)?;
+            let reconstructed = in_memory_shard.to_bytes()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to serialize in-memory shard: {e:?}")))?;
+            Ok::<Option<Vec<u8>>, PyErr>(Some(reconstructed))
+        } else {
+            Ok::<Option<Vec<u8>>, PyErr>(None)
+        }
+    })?;
+
+    if let Some(reconstructed) = result {
         let bytes = pyo3::types::PyBytes::new(py, &reconstructed);
         Ok(bytes.into())
     } else {
