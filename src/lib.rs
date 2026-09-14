@@ -529,8 +529,9 @@ impl ShardIndex {
 
         let mut output_buffer = vec![0u8; total_size];
 
-        self.rt.block_on(async {
-            let client = self.client.clone();
+        py.allow_threads(|| {
+            self.rt.block_on(async {
+                let client = self.client.clone();
             
             let mut results: Vec<Result<Vec<u8>, String>> = Vec::new();
             if !fetch_tasks.is_empty() {
@@ -582,6 +583,7 @@ impl ShardIndex {
             }
             
             Ok::<(), PyErr>(())
+        })
         })?;
 
         let bytes = PyBytes::new(py, &output_buffer);
