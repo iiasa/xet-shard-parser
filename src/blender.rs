@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use redb::ReadableTableMetadata;
 use std::collections::{HashSet, HashMap};
 use std::io::Cursor;
 use reqwest::Client as ReqwestClient;
@@ -57,6 +58,22 @@ fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Ve
     let xorb_obj = XorbObject::deserialize(&mut reader).ok()?;
     let info = xorb_obj.info;
     Some((info.chunk_hashes, info.chunk_boundary_offsets, info.unpacked_chunk_offsets))
+}
+
+fn get_current_rss_mb() -> f64 {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<f64>() {
+                        return kb / 1024.0;
+                    }
+                }
+            }
+        }
+    }
+    0.0
 }
 
 use mdb_shard::metadata_shard::ShardFileManager;
@@ -162,18 +179,35 @@ pub fn _consolidate_metadata(
     };
 
     // 2. Process Sparse XORBs Incrementally with Parallel Fetching and HTTP Range
-    let mut sparse_keys = Vec::new();
-    for item in sparse_xorbs.iter().unwrap() {
-        let (k, _) = item.unwrap();
-        sparse_keys.push(*k.value());
-    }
-    
-    let total_sparse = sparse_keys.len();
-    eprintln!("[GC] Found {} sparse XORBs to consolidate.", total_sparse);
+    let total_sparse = match sparse_xorbs.len() {
+        Ok(len) => len as usize,
+        Err(_) => 0,
+    };
+    eprintln!("[GC] Found {} sparse XORBs to consolidate (RSS: {:.1} MB).", total_sparse, get_current_rss_mb());
 
     let batch_size = 50;
-    for (batch_idx, chunk) in sparse_keys.chunks(batch_size).enumerate() {
-        eprintln!("[GC] Processing sparse XORB batch {}/{}...", batch_idx + 1, (total_sparse + batch_size - 1) / batch_size);
+    let mut chunk = Vec::with_capacity(batch_size);
+    let mut batch_idx = 0;
+    let total_batches = if total_sparse > 0 { (total_sparse + batch_size - 1) / batch_size } else { 1 };
+
+    let mut sparse_iter = sparse_xorbs.iter().unwrap();
+    let mut done = false;
+    while !done {
+        chunk.clear();
+        for _ in 0..batch_size {
+            if let Some(item) = sparse_iter.next() {
+                let (k, _) = item.unwrap();
+                chunk.push(*k.value());
+            } else {
+                done = true;
+                break;
+            }
+        }
+        if chunk.is_empty() {
+            break;
+        }
+        batch_idx += 1;
+        eprintln!("[GC] Processing sparse XORB batch {}/{} (RSS: {:.1} MB)...", batch_idx, total_batches, get_current_rss_mb());
         
         // 2a. Fetch Footers Concurrently
         let footer_results = rt.block_on(async {
@@ -497,9 +531,10 @@ async fn upload_file_reqwest_http1(client: &Client, bucket: &str, key: &str, fil
     loop {
         attempts += 1;
         
-        let file = tokio::fs::File::open(file_path).await.map_err(|e| format!("Failed to open file: {:?}", e))?;
-        let meta = file.metadata().await.map_err(|e| format!("Failed to read meta: {:?}", e))?;
+        let file = tokio::fs::File::open(file_path).await.map_err(|e| format!("Failed to open file {file_path}: {:?}", e))?;
+        let meta = file.metadata().await.map_err(|e| format!("Failed to read meta for {file_path}: {:?}", e))?;
         let size = meta.len();
+        eprintln!("[GC Upload] Uploading {} ({:.2} MB, attempt {}/5)...", key, size as f64 / (1024.0 * 1024.0), attempts);
         let body = reqwest::Body::from(file);
         
         let request = reqwest_client.put(presigned.uri().to_string())
@@ -507,16 +542,21 @@ async fn upload_file_reqwest_http1(client: &Client, bucket: &str, key: &str, fil
             .body(body);
             
         match request.send().await {
-            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) if r.status().is_success() => {
+                eprintln!("[GC Upload] Successfully uploaded {} ({} bytes)", key, size);
+                return Ok(());
+            }
             Ok(r) => {
                 let status = r.status();
                 let text = r.text().await.unwrap_or_default();
                 let err = format!("HTTP {}: {}", status, text);
+                eprintln!("[GC Upload] Attempt {} failed for {}: {}", attempts, key, err);
                 if attempts >= 5 {
                     return Err(format!("Failed to put {}: {}", key, err));
                 }
             }
             Err(e) => {
+                eprintln!("[GC Upload] Attempt {} network error for {}: {:?}", attempts, key, e);
                 if attempts >= 5 {
                     return Err(format!("Reqwest error putting {}: {:?}", key, e));
                 }
@@ -719,9 +759,10 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await
+            .map_err(|e| format!("Failed to upload staged lock: {e}"))?;
         Ok::<_, String>(())
-    }).unwrap();
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
     Ok(())
@@ -779,6 +820,7 @@ pub fn _verify_gc_transaction(
     }
     
     // 1. Download staging shards, cryptographically verify, and save to SFM disk
+    eprintln!("[GC Verify] Phase 1: Downloading & validating staged shards (Current RSS: {} MB)...", get_current_rss_mb());
     let mut validation_err = None;
     rt.block_on(async {
         for shard_hash in &new_shards {
@@ -828,7 +870,9 @@ pub fn _verify_gc_transaction(
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
 
     // 2. Gather unique XORB dependencies for all live files (Pass 1)
+    eprintln!("[GC Verify] Phase 2: Scanning live files from GC_LIVE_FILES_TABLE... (Current RSS: {} MB)", get_current_rss_mb());
     let mut missing_count = 0;
+    let mut files_scanned = 0;
     
     let mut missing_table = write_txn.open_table(TXN_MISSING_FILES_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     let mut unique_xorbs_table = write_txn.open_table(TXN_UNIQUE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
@@ -839,6 +883,11 @@ pub fn _verify_gc_transaction(
         let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
         if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
             for item in files_table.iter().unwrap() {
+                files_scanned += 1;
+                if files_scanned % 10000 == 0 {
+                    eprintln!("[GC Verify] Phase 2: Scanned {} files (RSS: {} MB)", files_scanned, get_current_rss_mb());
+                }
+                
                 let (file_hash_bytes, _) = item.unwrap();
                 let mut h = [0u8; 32];
                 h.copy_from_slice(file_hash_bytes.value());
@@ -880,6 +929,7 @@ pub fn _verify_gc_transaction(
     }
     
     // 3. Concurrently verify all required XORBs actually exist physically
+    eprintln!("[GC Verify] Phase 3: Verifying unique XORBs on S3 in batches of 100... (Current RSS: {} MB)", get_current_rss_mb());
     use futures::stream::{StreamExt, iter};
     let mut missing_xorbs_table = write_txn.open_table(TXN_MISSING_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
@@ -912,17 +962,23 @@ pub fn _verify_gc_transaction(
         
         for (xh, exists) in results {
             if !exists {
+                eprintln!("[GC Verify] Phase 3: Missing XORB detected: {}", xh);
                 missing_xorbs_table.insert(xh.as_str(), ()).unwrap();
             }
         }
         b.clear();
     };
 
+    let mut xorbs_scanned = 0;
     for item in unique_xorbs_table.iter().unwrap() {
         let (k, _) = item.unwrap();
         batch.push(k.value().to_string());
         if batch.len() >= 100 {
             process_batch(&mut batch);
+            xorbs_scanned += 100;
+            if xorbs_scanned % 1000 == 0 {
+                eprintln!("[GC Verify] Phase 3: Verified {} XORBs (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
+            }
         }
     }
     if !batch.is_empty() {
@@ -930,6 +986,7 @@ pub fn _verify_gc_transaction(
     }
     
     // 4. Second pass to stream files and check for missing XORB intersections
+    eprintln!("[GC Verify] Phase 4: Resolving missing files for missing XORBs... (Current RSS: {} MB)", get_current_rss_mb());
     let mut missing_xorbs_empty = true;
     for _ in missing_xorbs_table.iter().unwrap() {
         missing_xorbs_empty = false;
@@ -974,6 +1031,7 @@ pub fn _verify_gc_transaction(
         }
     }
 
+    eprintln!("[GC Verify] Phase 5: Committing verification results (missing files: {})", missing_count);
     if missing_count == 0 {
         let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         meta.insert("status", "verified").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
@@ -990,11 +1048,13 @@ pub fn _verify_gc_transaction(
     write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit err: {e}")))?;
     drop(db);
     
+    eprintln!("[GC Verify] Phase 6: Uploading active_transaction.redb to S3 (RSS: {} MB)...", get_current_rss_mb());
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await
+            .map_err(|e| format!("Failed to upload verified lock: {e}"))?;
         Ok::<_, String>(())
-    }).unwrap();
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
     Ok(missing_count)
@@ -1034,9 +1094,10 @@ pub fn _commit_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await
+            .map_err(|e| format!("Failed to upload committed lock: {e}"))?;
         Ok::<_, String>(())
-    }).unwrap();
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
     Ok(())
@@ -1135,9 +1196,10 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.unwrap();
+        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await
+            .map_err(|e| format!("Failed to upload reverted lock: {e}"))?;
         Ok::<_, String>(())
-    }).unwrap();
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
     Ok(())
