@@ -26,24 +26,7 @@ const GC_XORB_CHUNKS_TABLE: redb::TableDefinition<&[u8; 32], &[u8]> = redb::Tabl
 
 fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
     let mut reader = Cursor::new(bytes);
-    
-    // Debug info_length
-    if bytes.len() >= 4 {
-        let mut info_length = [0u8; 4];
-        info_length.copy_from_slice(&bytes[bytes.len()-4..]);
-        let info_len_u32 = u32::from_le_bytes(info_length);
-        
-        let last_16 = if bytes.len() >= 16 { &bytes[bytes.len()-16..] } else { bytes };
-        eprintln!("DEBUG: parse_xorb_footer_data: info_length = {}, bytes.len() = {}, last_16_bytes = {:?}", info_len_u32, bytes.len(), last_16);
-    }
-
-    let xorb_obj = match XorbObject::deserialize(&mut reader) {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("DEBUG: XorbObject::deserialize failed: {:?}", e);
-            return None;
-        }
-    };
+    let xorb_obj = XorbObject::deserialize(&mut reader).ok()?;
     let info = xorb_obj.info;
     Some((info.chunk_hashes, info.chunk_boundary_offsets, info.unpacked_chunk_offsets))
 }
@@ -441,7 +424,6 @@ impl ShardIndex {
                 }
             }
 
-            eprintln!("DEBUG: needed_xorbs count: {}, fetch_tasks count: {}, xorb_urls count: {}", needed_xorbs.len(), fetch_tasks.len(), xorb_urls.len());
             if !fetch_tasks.is_empty() {
                 let results: Vec<(MerkleHash, Option<Vec<u8>>)> = futures::stream::iter(fetch_tasks)
                     .map(|(xh, url)| {
@@ -458,10 +440,7 @@ impl ShardIndex {
                                     let bytes_res = r.bytes().await;
                                     match bytes_res {
                                         Ok(b) => (xh, Some(b.to_vec())),
-                                        Err(e) => {
-                                            eprintln!("DEBUG: r.bytes().await failed for xh: {} with error: {}", xh.hex(), e);
-                                            (xh, None)
-                                        }
+                                        Err(_) => (xh, None)
                                     }
                                 }
                                 Ok(r) => {
@@ -481,17 +460,8 @@ impl ShardIndex {
 
                 for (xh, bytes_opt) in results {
                     let footer = match bytes_opt {
-                        Some(bytes) => {
-                            let parsed = parse_xorb_footer_data(&bytes);
-                            if parsed.is_none() {
-                                eprintln!("DEBUG: parse_xorb_footer_data failed for xh: {}, bytes length: {}", xh.hex(), bytes.len());
-                            }
-                            parsed
-                        }
-                        None => {
-                            eprintln!("DEBUG: bytes_opt is None for xh: {} (perhaps r.bytes().await failed?)", xh.hex());
-                            None
-                        }
+                        Some(bytes) => parse_xorb_footer_data(&bytes),
+                        None => None,
                     };
                     xorb_footers.insert(xh, footer);
                 }
