@@ -768,6 +768,26 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
     Ok(())
 }
 
+async fn check_exists_with_retry(client: &Client, bucket: &str, key: &str, max_attempts: u32) -> Result<bool, String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match client.head_object().bucket(bucket).key(key).send().await {
+            Ok(_) => return Ok(true),
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+                    return Ok(false);
+                }
+                if attempts >= max_attempts {
+                    return Err(format!("Network error checking {}: {}", key, err_str));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
+            }
+        }
+    }
+}
+
 pub fn _verify_gc_transaction(
     sfm: Arc<ShardFileManager>,
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
@@ -944,10 +964,12 @@ pub fn _verify_gc_transaction(
                     let key_staged = format!("gc_consolidated/xorbs/{}", xh);
                     let key_live = format!("xorbs/default/{}", xh);
                     
-                    if client.head_object().bucket(&bucket).key(&key_staged).send().await.is_ok() {
+                    let staged = check_exists_with_retry(&client, &bucket, &key_staged, 5).await.unwrap_or(true);
+                    if staged {
                         return (xh, true);
                     }
-                    if client.head_object().bucket(&bucket).key(&key_live).send().await.is_ok() {
+                    let live = check_exists_with_retry(&client, &bucket, &key_live, 5).await.unwrap_or(true);
+                    if live {
                         return (xh, true);
                     }
                     (xh, false)
@@ -1273,19 +1295,20 @@ pub fn _prune_garbage() -> PyResult<()> {
             }
         }
         
-        // Delete lock file if it exists and is committed or reverted
+        // Delete lock file on s3 and local path if it is not staged
         let txn_path = "/tmp/active_transaction.redb";
         let lock_key = "gc/active_transaction.redb";
         
+        let mut should_delete = false;
         if let Ok(Some(data)) = download_with_retry(&client, &bucket, lock_key, 5).await {
-            if let Ok(_) = std::fs::write(txn_path, data) {
+            if let Ok(_) = std::fs::write(txn_path, &data) {
                 if let Ok(db) = Database::open(txn_path) {
                     if let Ok(read_txn) = db.begin_read() {
                         if let Ok(meta_table) = read_txn.open_table(TXN_META_TABLE) {
                             if let Ok(Some(status)) = meta_table.get("status") {
                                 let status_val = status.value().to_string();
-                                if status_val == "committed" || status_val == "reverted" {
-                                    let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
+                                if status_val != "staged" {
+                                    should_delete = true;
                                 }
                             }
                         }
@@ -1293,7 +1316,11 @@ pub fn _prune_garbage() -> PyResult<()> {
                 }
             }
         }
-        let _ = std::fs::remove_file(txn_path);
+        
+        if should_delete {
+            let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
+            let _ = std::fs::remove_file(txn_path);
+        }
 
         Ok::<_, String>(())
     }).unwrap();
