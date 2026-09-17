@@ -220,8 +220,8 @@ pub fn _consolidate_metadata(
                     let xorb_hash = MerkleHash::from(hash_bytes);
                     let xorb_hash_str = xorb_hash.hex();
                     let key = format!("xorbs/default/{}", xorb_hash_str);
-                    let footer_bytes_opt = download_range_with_retry(&client, &bucket, &key, "bytes=-1048576", 5).await.ok().flatten();
-                    (hash_bytes, footer_bytes_opt)
+                    let footer_bytes_result = download_range_with_retry(&client, &bucket, &key, "bytes=-1048576", 5).await;
+                    (hash_bytes, footer_bytes_result)
                 }
             });
             iter(futures_iter).buffer_unordered(batch_size).collect::<Vec<_>>().await
@@ -238,7 +238,9 @@ pub fn _consolidate_metadata(
         
         let mut xorbs_to_fetch = Vec::new();
         
-        for (hash_bytes, footer_bytes_opt) in footer_results {
+        for (hash_bytes, footer_bytes_result) in footer_results {
+            let footer_bytes_opt = footer_bytes_result.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
+            
             let xorb_hash = MerkleHash::from(hash_bytes);
             let xorb_hash_str = xorb_hash.hex();
             old_xorbs_table.insert(xorb_hash_str.as_str(), ()).unwrap();
@@ -301,8 +303,8 @@ pub fn _consolidate_metadata(
                 let range_header = format!("bytes={}-{}", req.start, req.end - 1);
                 
                 range_futures.push(async move {
-                    let bytes_opt = download_range_with_retry(&client, &bucket, &key, &range_header, 5).await.ok().flatten();
-                    (req, bytes_opt)
+                    let bytes_result = download_range_with_retry(&client, &bucket, &key, &range_header, 5).await;
+                    (req, bytes_result)
                 });
             }
         }
@@ -313,7 +315,8 @@ pub fn _consolidate_metadata(
         });
         
         // 2d. Process Fetched Ranges
-        for (req, bytes_opt) in fetched_ranges {
+        for (req, bytes_result) in fetched_ranges {
+            let bytes_opt = bytes_result.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
             if let Some(bytes) = bytes_opt {
                 let mut offset = 0;
                 for j in 0..req.hashes.len() {
@@ -885,7 +888,7 @@ pub fn _verify_gc_transaction(
     let verify_sfm = rt.block_on(async {
         let ctx = xet_runtime::core::context::XetContext::default()
             .map_err(|e| format!("Failed to create context: {:?}", e))?;
-        ShardFileManager::new_in_cache_directory(&ctx, sfm.shard_directory()).await
+        ShardFileManager::new_in_session_directory(&ctx, sfm.shard_directory(), true).await
             .map_err(|e| format!("Failed to create verification ShardFileManager: {:?}", e))
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
 
