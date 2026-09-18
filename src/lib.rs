@@ -209,8 +209,9 @@ impl ShardIndex {
 
     #[pyo3(signature = ())]
     pub fn verify_gc_transaction(&self, py: Python<'_>) -> PyResult<usize> {
+        let original_shard_dir = self.sfm.shard_directory().to_path_buf();
         let missing = py.allow_threads(|| {
-            blender::_verify_gc_transaction(self.sfm.clone(), self.gc_db.clone())
+            blender::_verify_gc_transaction(original_shard_dir, self.gc_db.clone())
         })?;
         Ok(missing)
     }

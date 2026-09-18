@@ -792,7 +792,7 @@ async fn check_exists_with_retry(client: &Client, bucket: &str, key: &str, max_a
 }
 
 pub fn _verify_gc_transaction(
-    sfm: Arc<ShardFileManager>,
+    original_shard_dir: std::path::PathBuf,
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
 ) -> PyResult<usize> {
     let rt = Runtime::new().unwrap();
@@ -824,47 +824,118 @@ pub fn _verify_gc_transaction(
     
     // Extract new shards into memory
     let mut new_shards = Vec::new();
-    
     if let Ok(shards_table) = write_txn.open_table(TXN_NEW_SHARDS_TABLE) {
         for item in shards_table.iter().unwrap() {
             let (hash_key, _) = item.unwrap();
             new_shards.push(hash_key.value().to_string());
         }
     }
+    let mut old_shards = std::collections::HashSet::new();
     if let Ok(old_shards_table) = write_txn.open_table(TXN_OLD_SHARDS_TABLE) {
         for item in old_shards_table.iter().unwrap() {
             let (hash_key, _) = item.unwrap();
-            let hash_hex = hash_key.value().to_string();
-            
-            // Prune old shards from sfm so it is forced to use surviving shards
-            let shard_path = sfm.shard_directory().join(format!("{}.mdb", hash_hex));
-            let _ = std::fs::remove_file(shard_path);
+            old_shards.insert(hash_key.value().to_string());
         }
     }
     
-    // 1. Download staging shards, cryptographically verify, and save to SFM disk
-    eprintln!("[GC Verify] Phase 1: Downloading & validating staged shards (Current RSS: {} MB)...", get_current_rss_mb());
+    // Create Unique Temp Directory
+    let temp_dir_name = format!("gc_verify_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros());
+    let temp_shard_dir = std::env::temp_dir().join(temp_dir_name);
+    if let Err(e) = std::fs::create_dir_all(&temp_shard_dir) {
+        return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to create temp dir: {:?}", e)));
+    }
+    
+    eprintln!("[GC Verify] Phase 1: Validating shards from S3 ground truth (Current RSS: {} MB)...", get_current_rss_mb());
     let mut validation_err = None;
+    let mut shards_to_register = Vec::new();
+
     rt.block_on(async {
+        use futures::stream::StreamExt;
+        let mut s3_shards = Vec::new();
+        let mut tombstones = std::collections::HashSet::new();
+        let mut objects_stream = client.list_objects_v2().bucket(&bucket).prefix("shards/").into_paginator().send();
+        while let Some(page) = objects_stream.next().await {
+            match page {
+                Ok(out) => {
+                    for obj in out.contents() {
+                        if let Some(key) = obj.key() {
+                            if key.contains("tombstones/") && key.ends_with(".revoked") {
+                                if let Some(stem) = std::path::Path::new(key).file_stem().and_then(|s| s.to_str()) {
+                                    tombstones.insert(stem.to_string());
+                                }
+                            } else if key.ends_with(".mdb") {
+                                if let Some(stem) = std::path::Path::new(key).file_stem().and_then(|s| s.to_str()) {
+                                    s3_shards.push(stem.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    validation_err = Some(format!("Failed to list shards from S3: {:?}", e));
+                    return;
+                }
+            }
+        }
+        
+        for shard_hash in s3_shards {
+            if old_shards.contains(&shard_hash) || tombstones.contains(&shard_hash) {
+                continue;
+            }
+            let local_path = original_shard_dir.join(format!("{}.mdb", shard_hash));
+            let temp_path = temp_shard_dir.join(format!("{}.mdb", shard_hash));
+            
+            if local_path.exists() {
+                if let Err(e) = std::fs::copy(&local_path, &temp_path) {
+                    validation_err = Some(format!("Failed to copy shard to temp dir {}: {:?}", shard_hash, e));
+                    break;
+                }
+                shards_to_register.push(temp_path);
+            } else {
+                let key = format!("shards/{}.mdb", shard_hash);
+                match download_with_retry(&client, &bucket, &key, 5).await {
+                    Ok(Some(bytes)) => {
+                        if let Err(e) = MDBMinimalShard::from_reader(&mut std::io::Cursor::new(&bytes), true, true) {
+                            validation_err = Some(format!("Cryptographic validation failed for missing local {}: {:?}", shard_hash, e));
+                            break;
+                        }
+                        if let Err(e) = std::fs::write(&temp_path, &bytes) {
+                            validation_err = Some(format!("Failed to write downloaded shard {}: {:?}", shard_hash, e));
+                            break;
+                        }
+                        shards_to_register.push(temp_path);
+                    }
+                    Ok(None) => {
+                        validation_err = Some(format!("Failed to download missing local body for {}", shard_hash));
+                        break;
+                    }
+                    Err(e) => {
+                        validation_err = Some(format!("Failed to fetch missing local shard {}: {:?}", shard_hash, e));
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if validation_err.is_some() { return; }
+        
         for shard_hash in &new_shards {
             let key = format!("gc_consolidated/shards/{}.mdb", shard_hash);
             match download_with_retry(&client, &bucket, &key, 5).await {
                 Ok(Some(bytes)) => {
-                    // Hybrid Check: Strictly verify the Merkle/CRC bytes
                     if let Err(e) = MDBMinimalShard::from_reader(&mut std::io::Cursor::new(&bytes), true, true) {
-                        validation_err = Some(format!("Cryptographic validation failed for {}: {:?}", shard_hash, e));
+                        validation_err = Some(format!("Cryptographic validation failed for staged shard {}: {:?}", shard_hash, e));
                         break;
                     }
-                    
-                    // Save pristine shard directly to the local sfm cache disk
-                    let shard_path = sfm.shard_directory().join(format!("{}.mdb", shard_hash));
-                    if let Err(e) = std::fs::write(&shard_path, &bytes) {
-                        validation_err = Some(format!("Failed to write verified shard {} to disk: {:?}", shard_hash, e));
+                    let temp_path = temp_shard_dir.join(format!("{}.mdb", shard_hash));
+                    if let Err(e) = std::fs::write(&temp_path, &bytes) {
+                        validation_err = Some(format!("Failed to write staged shard {}: {:?}", shard_hash, e));
                         break;
                     }
+                    shards_to_register.push(temp_path);
                 }
                 Ok(None) => {
-                    validation_err = Some(format!("Failed to download body for {}", shard_hash));
+                    validation_err = Some(format!("Failed to download staged shard body for {}", shard_hash));
                     break;
                 }
                 Err(e) => {
@@ -873,24 +944,27 @@ pub fn _verify_gc_transaction(
                 }
             }
         }
-        
-        if validation_err.is_none() {
-            // Load the newly saved, verified shards into the sfm index natively, alongside surviving shards
-            let _ = sfm.refresh_shard_dir(false, 0).await;
-        }
     });
 
     if let Some(err_msg) = validation_err {
+        let _ = std::fs::remove_dir_all(&temp_shard_dir);
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(err_msg));
     }
 
-    // Create a fresh isolated ShardFileManager instance from disk to guarantee zero in-memory stale handles
     let verify_sfm = rt.block_on(async {
         let ctx = xet_runtime::core::context::XetContext::default()
             .map_err(|e| format!("Failed to create context: {:?}", e))?;
-        ShardFileManager::new_in_session_directory(&ctx, sfm.shard_directory(), true).await
-            .map_err(|e| format!("Failed to create verification ShardFileManager: {:?}", e))
-    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
+        let sfm = ShardFileManager::new_in_session_directory(&ctx, &temp_shard_dir, false).await
+            .map_err(|e| format!("Failed to create verification ShardFileManager: {:?}", e))?;
+            
+        sfm.register_shards_by_path(&shards_to_register).await
+            .map_err(|e| format!("Failed to register shards: {:?}", e))?;
+            
+        Ok::<_, String>(sfm)
+    }).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&temp_shard_dir);
+        PyErr::new::<pyo3::exceptions::PyIOError, _>(e)
+    })?;
 
     // 2. Gather unique XORB dependencies for all live files (Pass 1)
     eprintln!("[GC Verify] Phase 2: Scanning live files from GC_LIVE_FILES_TABLE... (Current RSS: {} MB)", get_current_rss_mb());
@@ -1047,6 +1121,9 @@ pub fn _verify_gc_transaction(
                     
                     let mut xorb_deps = Vec::new();
                     let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                    if file_hash_hex == "7e4bf909e255ae8619c2646ca575c83825925871ea2a420f268838f7b6b9742c" {
+                        eprintln!("[DEBUG target file] get_file_reconstruction_info res = {:?}", res);
+                    }
                     if let Ok(Some((info, _))) = res {
                         for segment in info.segments {
                             xorb_deps.push(segment.xorb_hash.hex());
@@ -1098,6 +1175,7 @@ pub fn _verify_gc_transaction(
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
+    let _ = std::fs::remove_dir_all(&temp_shard_dir);
     Ok(missing_count)
 }
 
