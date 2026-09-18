@@ -530,15 +530,14 @@ async fn upload_file_reqwest_http1(client: &Client, bucket: &str, key: &str, fil
         .build()
         .map_err(|e| format!("Reqwest init failed: {:?}", e))?;
         
+    let file_data = tokio::fs::read(file_path).await.map_err(|e| format!("Failed to read file {file_path}: {:?}", e))?;
+    let size = file_data.len();
+    
     let mut attempts = 0;
     loop {
         attempts += 1;
-        
-        let file = tokio::fs::File::open(file_path).await.map_err(|e| format!("Failed to open file {file_path}: {:?}", e))?;
-        let meta = file.metadata().await.map_err(|e| format!("Failed to read meta for {file_path}: {:?}", e))?;
-        let size = meta.len();
         eprintln!("[GC Upload] Uploading {} ({:.2} MB, attempt {}/5)...", key, size as f64 / (1024.0 * 1024.0), attempts);
-        let body = reqwest::Body::from(file);
+        let body = reqwest::Body::from(file_data.clone());
         
         let request = reqwest_client.put(presigned.uri().to_string())
             .header("Content-Length", size.to_string())
@@ -879,7 +878,7 @@ pub fn _verify_gc_transaction(
         }
         
         for shard_hash in s3_shards {
-            if old_shards.contains(&shard_hash) || tombstones.contains(&shard_hash) {
+            if tombstones.contains(&shard_hash) {
                 continue;
             }
             let local_path = original_shard_dir.join(format!("{}.mdb", shard_hash));
@@ -918,32 +917,6 @@ pub fn _verify_gc_transaction(
         }
         
         if validation_err.is_some() { return; }
-        
-        for shard_hash in &new_shards {
-            let key = format!("gc_consolidated/shards/{}.mdb", shard_hash);
-            match download_with_retry(&client, &bucket, &key, 5).await {
-                Ok(Some(bytes)) => {
-                    if let Err(e) = MDBMinimalShard::from_reader(&mut std::io::Cursor::new(&bytes), true, true) {
-                        validation_err = Some(format!("Cryptographic validation failed for staged shard {}: {:?}", shard_hash, e));
-                        break;
-                    }
-                    let temp_path = temp_shard_dir.join(format!("{}.mdb", shard_hash));
-                    if let Err(e) = std::fs::write(&temp_path, &bytes) {
-                        validation_err = Some(format!("Failed to write staged shard {}: {:?}", shard_hash, e));
-                        break;
-                    }
-                    shards_to_register.push(temp_path);
-                }
-                Ok(None) => {
-                    validation_err = Some(format!("Failed to download staged shard body for {}", shard_hash));
-                    break;
-                }
-                Err(e) => {
-                    validation_err = Some(format!("Failed to fetch staged shard {}: {:?}", shard_hash, e));
-                    break;
-                }
-            }
-        }
     });
 
     if let Some(err_msg) = validation_err {
