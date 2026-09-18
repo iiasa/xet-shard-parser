@@ -919,7 +919,14 @@ pub fn _verify_gc_transaction(
                 let mut xorb_deps = Vec::new();
                 let mut found = true;
                 
+                let is_target = file_hash_hex == "7e4bf909e255ae8619c2646ca575c83825925871ea2a420f268838f7b6b9742c";
+                
                 let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                
+                if is_target {
+                    eprintln!("[DEBUG target file] get_file_reconstruction_info res = {:?}", res);
+                }
+                
                 match res {
                     Ok(Some((info, _))) => {
                         for segment in info.segments {
@@ -927,6 +934,9 @@ pub fn _verify_gc_transaction(
                         }
                     },
                     _ => {
+                        if is_target {
+                            eprintln!("[DEBUG target file] Target marked missing because res was not Ok(Some)");
+                        }
                         found = false;
                     }
                 }
@@ -940,6 +950,9 @@ pub fn _verify_gc_transaction(
                 // Validate XORBs
                 for xh in &xorb_deps {
                     if old_xorbs_table.get(xh.as_str()).unwrap().is_some() {
+                        if is_target {
+                            eprintln!("[DEBUG target file] Target marked missing because XORB dependency {} is in old_xorbs_table (deleted tombstone)", xh);
+                        }
                         // Dangling pointer to deleted tombstone!
                         missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
                         missing_count += 1;
@@ -1043,6 +1056,9 @@ pub fn _verify_gc_transaction(
                     let mut has_missing = false;
                     for xh in xorb_deps {
                         if missing_xorbs_table.get(xh.as_str()).unwrap().is_some() {
+                            if file_hash_hex == "7e4bf909e255ae8619c2646ca575c83825925871ea2a420f268838f7b6b9742c" {
+                                eprintln!("[DEBUG target file] Target marked missing in Phase 4 because XORB {} is missing in S3", xh);
+                            }
                             has_missing = true;
                             break;
                         }
