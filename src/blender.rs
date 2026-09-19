@@ -51,6 +51,7 @@ pub const TXN_NEW_SHARDS_TABLE: TableDefinition<&str, ()> = TableDefinition::new
 pub const TXN_CHUNK_MAP_TABLE: TableDefinition<&[u8; 32], &[u8; 36]> = TableDefinition::new("txn_chunk_map");
 pub const TXN_XORB_LAYOUT_TABLE: TableDefinition<&[u8; 36], &[u8; 32]> = TableDefinition::new("txn_xorb_layout");
 pub const TXN_MISSING_FILES_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_missing_files");
+pub const TXN_MISSING_POST_FILES_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_missing_post_files");
 pub const TXN_UNIQUE_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_unique_xorbs");
 pub const TXN_MISSING_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_missing_xorbs");
 fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
@@ -790,63 +791,21 @@ async fn check_exists_with_retry(client: &Client, bucket: &str, key: &str, max_a
     }
 }
 
-pub fn _verify_gc_transaction(
+fn _verify_pre_gc_transaction(
     sfm: Arc<ShardFileManager>,
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    write_txn: &redb::WriteTransaction,
+    rt: &Runtime,
 ) -> PyResult<usize> {
-    let rt = Runtime::new().unwrap();
-    let (client, bucket) = _setup_s3_client()?;
-    let txn_path = "/tmp/active_transaction.redb";
-    
-    rt.block_on(async {
-        let key = "gc/active_transaction.redb";
-        let data = download_with_retry(&client, &bucket, key, 5).await?
-            .ok_or_else(|| format!("Lock file {} not found", key))?;
-        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
-        Ok::<_, String>(())
-    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-    
-    let db = Database::open(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
-    let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
-    
-    {
-        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let status_str = {
-            let status = meta.get("status").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-            status.unwrap().value().to_string()
-        };
-        
-        if status_str != "staged" && status_str != "consolidated" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot verify: status is not staged or consolidated"));
-        }
-    }
-    
-    // Extract new shards into memory
-    let mut new_shards = Vec::new();
-    if let Ok(shards_table) = write_txn.open_table(TXN_NEW_SHARDS_TABLE) {
-        for item in shards_table.iter().unwrap() {
-            let (hash_key, _) = item.unwrap();
-            new_shards.push(hash_key.value().to_string());
-        }
-    }
-    let mut old_shards = std::collections::HashSet::new();
-    if let Ok(old_shards_table) = write_txn.open_table(TXN_OLD_SHARDS_TABLE) {
-        for item in old_shards_table.iter().unwrap() {
-            let (hash_key, _) = item.unwrap();
-            old_shards.insert(hash_key.value().to_string());
-        }
-    }
-    
     let verify_sfm = sfm.clone();
-
-    // 2. Gather unique XORB dependencies for all live files (Pass 1)
-    eprintln!("[GC Verify] Phase 2: Scanning live files from GC_LIVE_FILES_TABLE... (Current RSS: {} MB)", get_current_rss_mb());
+    eprintln!("[GC Verify PRE] Phase 2: Scanning live files from GC_LIVE_FILES_TABLE... (Current RSS: {} MB)", get_current_rss_mb());
     let mut missing_count = 0;
     let mut files_scanned = 0;
     
     let mut missing_table = write_txn.open_table(TXN_MISSING_FILES_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     let mut unique_xorbs_table = write_txn.open_table(TXN_UNIQUE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-    let old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
     let gc_db_lock = gc_db.read().unwrap();
     if let Some(ref gcdb) = *gc_db_lock {
@@ -855,7 +814,7 @@ pub fn _verify_gc_transaction(
             for item in files_table.iter().unwrap() {
                 files_scanned += 1;
                 if files_scanned % 10000 == 0 {
-                    eprintln!("[GC Verify] Phase 2: Scanned {} files (RSS: {} MB)", files_scanned, get_current_rss_mb());
+                    eprintln!("[GC Verify PRE] Phase 2: Scanned {} files (RSS: {} MB)", files_scanned, get_current_rss_mb());
                 }
                 
                 let (file_hash_bytes, _) = item.unwrap();
@@ -866,13 +825,7 @@ pub fn _verify_gc_transaction(
                 let mut xorb_deps = Vec::new();
                 let mut found = true;
                 
-                let is_target = file_hash_hex == "7e4bf909e255ae8619c2646ca575c83825925871ea2a420f268838f7b6b9742c";
-                
                 let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
-                
-                if is_target {
-                    eprintln!("[DEBUG target file] get_file_reconstruction_info res = {:?}", res);
-                }
                 
                 match res {
                     Ok(Some((info, _))) => {
@@ -881,9 +834,6 @@ pub fn _verify_gc_transaction(
                         }
                     },
                     _ => {
-                        if is_target {
-                            eprintln!("[DEBUG target file] Target marked missing because res was not Ok(Some)");
-                        }
                         found = false;
                     }
                 }
@@ -894,17 +844,8 @@ pub fn _verify_gc_transaction(
                     continue;
                 }
                 
-                // Validate XORBs
+                // Validate XORBs - removed old_xorbs_table check to avoid false positives for repacked files
                 for xh in &xorb_deps {
-                    if old_xorbs_table.get(xh.as_str()).unwrap().is_some() {
-                        if is_target {
-                            eprintln!("[DEBUG target file] Target marked missing because XORB dependency {} is in old_xorbs_table (deleted tombstone)", xh);
-                        }
-                        // Dangling pointer to deleted tombstone!
-                        missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-                        missing_count += 1;
-                        break;
-                    }
                     unique_xorbs_table.insert(xh.as_str(), ()).unwrap();
                 }
             }
@@ -912,7 +853,7 @@ pub fn _verify_gc_transaction(
     }
     
     // 3. Concurrently verify all required XORBs actually exist physically
-    eprintln!("[GC Verify] Phase 3: Verifying unique XORBs on S3 in batches of 100... (Current RSS: {} MB)", get_current_rss_mb());
+    eprintln!("[GC Verify PRE] Phase 3: Verifying unique XORBs on S3 in batches of 100... (Current RSS: {} MB)", get_current_rss_mb());
     use futures::stream::{StreamExt, iter};
     let mut missing_xorbs_table = write_txn.open_table(TXN_MISSING_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
@@ -947,7 +888,7 @@ pub fn _verify_gc_transaction(
         
         for (xh, exists) in results {
             if !exists {
-                eprintln!("[GC Verify] Phase 3: Missing XORB detected: {}", xh);
+                eprintln!("[GC Verify PRE] Phase 3: Missing XORB detected: {}", xh);
                 missing_xorbs_table.insert(xh.as_str(), ()).unwrap();
             }
         }
@@ -962,7 +903,7 @@ pub fn _verify_gc_transaction(
             process_batch(&mut batch);
             xorbs_scanned += 100;
             if xorbs_scanned % 1000 == 0 {
-                eprintln!("[GC Verify] Phase 3: Verified {} XORBs (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
+                eprintln!("[GC Verify PRE] Phase 3: Verified {} XORBs (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
             }
         }
     }
@@ -971,7 +912,7 @@ pub fn _verify_gc_transaction(
     }
     
     // 4. Second pass to stream files and check for missing XORB intersections
-    eprintln!("[GC Verify] Phase 4: Resolving missing files for missing XORBs... (Current RSS: {} MB)", get_current_rss_mb());
+    eprintln!("[GC Verify PRE] Phase 4: Resolving missing files for missing XORBs... (Current RSS: {} MB)", get_current_rss_mb());
     let mut missing_xorbs_empty = true;
     for _ in missing_xorbs_table.iter().unwrap() {
         missing_xorbs_empty = false;
@@ -994,9 +935,6 @@ pub fn _verify_gc_transaction(
                     
                     let mut xorb_deps = Vec::new();
                     let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
-                    if file_hash_hex == "7e4bf909e255ae8619c2646ca575c83825925871ea2a420f268838f7b6b9742c" {
-                        eprintln!("[DEBUG target file] get_file_reconstruction_info res = {:?}", res);
-                    }
                     if let Ok(Some((info, _))) = res {
                         for segment in info.segments {
                             xorb_deps.push(segment.xorb_hash.hex());
@@ -1006,9 +944,6 @@ pub fn _verify_gc_transaction(
                     let mut has_missing = false;
                     for xh in xorb_deps {
                         if missing_xorbs_table.get(xh.as_str()).unwrap().is_some() {
-                            if file_hash_hex == "7e4bf909e255ae8619c2646ca575c83825925871ea2a420f268838f7b6b9742c" {
-                                eprintln!("[DEBUG target file] Target marked missing in Phase 4 because XORB {} is missing in S3", xh);
-                            }
                             has_missing = true;
                             break;
                         }
@@ -1022,8 +957,244 @@ pub fn _verify_gc_transaction(
         }
     }
 
-    eprintln!("[GC Verify] Phase 5: Committing verification results (missing files: {})", missing_count);
-    if missing_count == 0 {
+    Ok(missing_count)
+}
+
+fn _verify_post_gc_transaction(
+    sfm: Arc<ShardFileManager>,
+    gc_db: Arc<std::sync::RwLock<Option<Database>>>,
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    write_txn: &redb::WriteTransaction,
+    rt: &Runtime,
+) -> PyResult<usize> {
+    eprintln!("[GC Verify POST] Phase 1: Preparing temp ShardFileManager...");
+    
+    // Extract new shards and old shards from txn DB
+    let mut new_shards = Vec::new();
+    if let Ok(shards_table) = write_txn.open_table(TXN_NEW_SHARDS_TABLE) {
+        for item in shards_table.iter().unwrap() {
+            let (hash_key, _) = item.unwrap();
+            new_shards.push(hash_key.value().to_string());
+        }
+    }
+    let mut old_shards = std::collections::HashSet::new();
+    if let Ok(old_shards_table) = write_txn.open_table(TXN_OLD_SHARDS_TABLE) {
+        for item in old_shards_table.iter().unwrap() {
+            let (hash_key, _) = item.unwrap();
+            old_shards.insert(hash_key.value().to_string());
+        }
+    }
+
+    let temp_dir_path = std::env::temp_dir().join(format!("gc_verify_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&temp_dir_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Tempdir err: {e}")))?;
+    
+    let ctx = xet_runtime::core::context::XetContext::default()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Context err: {e:?}")))?;
+    
+    let verify_sfm = Arc::new(rt.block_on(async {
+        ShardFileManager::new_in_cache_directory(&ctx, temp_dir_path.to_string_lossy().to_string()).await
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("SFM init err: {e:?}")))?);
+
+    let active_shards = rt.block_on(async { sfm.registered_shard_list().await })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("SFM list err: {e:?}")))?;
+
+    let mut paths_to_register = Vec::new();
+    for shard in active_shards {
+        if !old_shards.contains(&shard.shard_hash.hex()) {
+            paths_to_register.push(shard.path.clone());
+        }
+    }
+
+    eprintln!("[GC Verify POST] Phase 1: Registering {} existing shards to temp SFM", paths_to_register.len());
+    rt.block_on(async {
+        verify_sfm.register_shards_by_path(&paths_to_register).await
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Register err: {e:?}")))?;
+
+    eprintln!("[GC Verify POST] Phase 1: Downloading and registering {} new shards", new_shards.len());
+    for ns in &new_shards {
+        let key = format!("gc_consolidated/shards/{}.mdb", ns);
+        let data = rt.block_on(async { download_with_retry(client, bucket, &key, 5).await })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Missing new shard: {}", key)))?;
+        
+        let path = temp_dir_path.join(format!("{}.mdb", ns));
+        std::fs::write(&path, &data).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write err: {e}")))?;
+        rt.block_on(async { verify_sfm.register_shards_by_path(&[path]).await })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Register new err: {e:?}")))?;
+    }
+
+    eprintln!("[GC Verify POST] Phase 2: Scanning live files from GC_LIVE_FILES_TABLE...");
+    let mut missing_count = 0;
+    let mut files_scanned = 0;
+    let mut missing_table = write_txn.open_table(TXN_MISSING_POST_FILES_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    let mut post_xorbs_table = write_txn.open_table(redb::TableDefinition::<&str, ()>::new("txn_unique_post_xorbs")).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    
+    let gc_db_lock = gc_db.read().unwrap();
+    if let Some(ref gcdb) = *gc_db_lock {
+        let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
+        if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
+            for item in files_table.iter().unwrap() {
+                files_scanned += 1;
+                if files_scanned % 10000 == 0 {
+                    eprintln!("[GC Verify POST] Phase 2: Scanned {} files", files_scanned);
+                }
+                
+                let (file_hash_bytes, _) = item.unwrap();
+                let mut h = [0u8; 32];
+                h.copy_from_slice(file_hash_bytes.value());
+                let file_hash_hex = MerkleHash::from(h).hex();
+                
+                let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                match res {
+                    Ok(Some((info, _))) => {
+                        for segment in info.segments {
+                            post_xorbs_table.insert(segment.xorb_hash.hex().as_str(), ()).unwrap();
+                        }
+                    },
+                    _ => {
+                        missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+                        missing_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!("[GC Verify POST] Phase 3: Verifying unique XORBs on S3 in batches of 100...");
+    use futures::stream::{StreamExt, iter};
+    let mut missing_xorbs_table = write_txn.open_table(redb::TableDefinition::<&str, ()>::new("txn_missing_post_xorbs")).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+    
+    let mut batch = Vec::with_capacity(100);
+    let mut process_batch = |b: &mut Vec<String>| {
+        let results = rt.block_on(async {
+            let futures_iter = b.iter().map(|xorb_hash_hex| {
+                let client = client.clone();
+                let bucket = bucket.clone();
+                let xh = xorb_hash_hex.clone();
+                async move {
+                    let key_staged = format!("gc_consolidated/xorbs/{}", xh);
+                    let key_live = format!("xorbs/default/{}", xh);
+                    let staged = check_exists_with_retry(&client, &bucket, &key_staged, 5).await.unwrap_or(true);
+                    if staged { return (xh, true); }
+                    let live = check_exists_with_retry(&client, &bucket, &key_live, 5).await.unwrap_or(true);
+                    if live { return (xh, true); }
+                    (xh, false)
+                }
+            });
+            iter(futures_iter).buffer_unordered(100).collect::<Vec<(String, bool)>>().await
+        });
+        
+        for (xh, exists) in results {
+            if !exists {
+                missing_xorbs_table.insert(xh.as_str(), ()).unwrap();
+            }
+        }
+        b.clear();
+    };
+
+    let mut xorbs_scanned = 0;
+    for item in post_xorbs_table.iter().unwrap() {
+        let (k, _) = item.unwrap();
+        batch.push(k.value().to_string());
+        if batch.len() >= 100 {
+            process_batch(&mut batch);
+            xorbs_scanned += 100;
+        }
+    }
+    if !batch.is_empty() {
+        process_batch(&mut batch);
+    }
+    
+    eprintln!("[GC Verify POST] Phase 4: Resolving missing files for missing XORBs...");
+    let mut missing_xorbs_empty = true;
+    for _ in missing_xorbs_table.iter().unwrap() {
+        missing_xorbs_empty = false;
+        break;
+    }
+
+    if !missing_xorbs_empty {
+        if let Some(ref gcdb) = *gc_db_lock {
+            let read_txn = gcdb.begin_read().unwrap();
+            if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
+                for item in files_table.iter().unwrap() {
+                    let (file_hash_bytes, _) = item.unwrap();
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(file_hash_bytes.value());
+                    let file_hash_hex = MerkleHash::from(h).hex();
+                    
+                    if missing_table.get(file_hash_hex.as_str()).unwrap().is_some() {
+                        continue;
+                    }
+                    
+                    let mut xorb_deps = Vec::new();
+                    let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                    if let Ok(Some((info, _))) = res {
+                        for segment in info.segments {
+                            xorb_deps.push(segment.xorb_hash.hex());
+                        }
+                    }
+                    
+                    let mut has_missing = false;
+                    for xh in xorb_deps {
+                        if missing_xorbs_table.get(xh.as_str()).unwrap().is_some() {
+                            has_missing = true;
+                            break;
+                        }
+                    }
+                    if has_missing {
+                        missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+                        missing_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(missing_count)
+}
+
+pub fn _verify_gc_transaction(
+    sfm: Arc<ShardFileManager>,
+    gc_db: Arc<std::sync::RwLock<Option<Database>>>,
+) -> PyResult<usize> {
+    let rt = Runtime::new().unwrap();
+    let (client, bucket) = _setup_s3_client()?;
+    let txn_path = "/tmp/active_transaction.redb";
+    
+    rt.block_on(async {
+        let key = "gc/active_transaction.redb";
+        let data = download_with_retry(&client, &bucket, key, 5).await?
+            .ok_or_else(|| format!("Lock file {} not found", key))?;
+        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
+        Ok::<_, String>(())
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
+    
+    let db = Database::open(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
+    let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
+    
+    {
+        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        let status_str = {
+            let status = meta.get("status").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+            status.unwrap().value().to_string()
+        };
+        
+        if status_str != "staged" && status_str != "consolidated" {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot verify: status is not staged or consolidated"));
+        }
+    }
+    
+    // Pass 1: PRE-GC
+    let missing_pre_gc = _verify_pre_gc_transaction(sfm.clone(), gc_db.clone(), &client, &bucket, &write_txn, &rt)?;
+    eprintln!("[GC Verify] PRE-GC Missing files: {}", missing_pre_gc);
+
+    // Pass 2: POST-GC
+    let missing_post_gc = _verify_post_gc_transaction(sfm.clone(), gc_db.clone(), &client, &bucket, &write_txn, &rt)?;
+    eprintln!("[GC Verify] POST-GC Missing files: {}", missing_post_gc);
+
+    eprintln!("[GC Verify] Phase 5: Committing verification results (missing files post-gc: {})", missing_post_gc);
+    if missing_post_gc == 0 {
         let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         meta.insert("status", "verified").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     } else {
@@ -1031,11 +1202,6 @@ pub fn _verify_gc_transaction(
         meta.insert("status", "failed").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     }
     
-    drop(missing_table);
-    drop(unique_xorbs_table);
-    drop(old_xorbs_table);
-    drop(missing_xorbs_table);
-
     write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit err: {e}")))?;
     drop(db);
     
@@ -1048,7 +1214,7 @@ pub fn _verify_gc_transaction(
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
-    Ok(missing_count)
+    Ok(missing_post_gc)
 }
 
 pub fn _commit_gc_transaction() -> PyResult<()> {
@@ -1378,6 +1544,17 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
         }
     }
     dict.set_item("missing_files", missing_files)?;
+
+    let missing_post_files = pyo3::types::PyList::empty(py);
+    if let Ok(table) = read_txn.open_table(TXN_MISSING_POST_FILES_TABLE) {
+        if let Ok(iter) = table.iter() {
+            for item in iter {
+                let (k, _) = item.unwrap();
+                missing_post_files.append(k.value())?;
+            }
+        }
+    }
+    dict.set_item("missing_post_files", missing_post_files)?;
 
     drop(read_txn);
     drop(db);
