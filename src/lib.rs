@@ -13,8 +13,16 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 mod blender;
-use futures::{StreamExt, TryStreamExt};
+pub mod s3_client;
+use futures::StreamExt;
 use reqwest::Client;
+
+use crate::s3_client::{
+    reqwest_download_footer_with_retry,
+    reqwest_download_and_decompress_range_with_retry,
+    MAX_S3_ATTEMPTS,
+    MAX_CONCURRENCY,
+};
 
 const GLOBAL_DEDUP_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb::TableDefinition::new("global_dedup");
 const GC_LIVE_CHUNKS_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_live_chunks");
@@ -61,6 +69,8 @@ impl ShardIndex {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
             .tcp_keepalive(std::time::Duration::from_secs(60))
+            .pool_idle_timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(MAX_CONCURRENCY)
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to build client: {e}")))?;
@@ -363,7 +373,7 @@ impl ShardIndex {
             };
             
             Python::with_gil(|py| {
-                Self::calculate_reconstruction_internal_sync(py, &file_hash_hex, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true), file_info)
+                Self::calculate_reconstruction_internal_sync(py, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true), file_info)
                     .map(|r| match r {
                         Some(dict) => dict.to_object(py),
                         None => py.None().into_ref(py).to_object(py),
@@ -425,40 +435,21 @@ impl ShardIndex {
             }
 
             if !fetch_tasks.is_empty() {
-                let results: Vec<(MerkleHash, Option<Vec<u8>>)> = futures::stream::iter(fetch_tasks)
+                let results: Vec<Result<(MerkleHash, Option<Vec<u8>>), String>> = futures::stream::iter(fetch_tasks)
                     .map(|(xh, url)| {
                         let client = client.clone();
                         async move {
-                            // Fetch last 1MB for footer
-                            let resp = client.get(&url)
-                                .header("Range", "bytes=-1048576")
-                                .send()
-                                .await;
-                            
-                            match resp {
-                                Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
-                                    let bytes_res = r.bytes().await;
-                                    match bytes_res {
-                                        Ok(b) => (xh, Some(b.to_vec())),
-                                        Err(_) => (xh, None)
-                                    }
-                                }
-                                Ok(r) => {
-                                    eprintln!("Footer fetch for {} failed with status: {}", xh.hex(), r.status());
-                                    (xh, None)
-                                }
-                                Err(e) => {
-                                    eprintln!("Footer fetch for {} failed with error: {}", xh.hex(), e);
-                                    (xh, None)
-                                }
-                            }
+                            let xh_hex = xh.hex();
+                            let bytes_opt = reqwest_download_footer_with_retry(&client, &url, &xh_hex, MAX_S3_ATTEMPTS).await?;
+                            Ok((xh, bytes_opt))
                         }
                     })
-                    .buffer_unordered(10)
+                    .buffer_unordered(MAX_CONCURRENCY)
                     .collect()
                     .await;
 
-                for (xh, bytes_opt) in results {
+                for res in results {
+                    let (xh, bytes_opt) = res.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
                     let footer = match bytes_opt {
                         Some(bytes) => parse_xorb_footer_data(&bytes),
                         None => None,
@@ -476,7 +467,7 @@ impl ShardIndex {
             
             Python::with_gil(|py| {
                 // Here we just call a purely synchronous helper function without blocking!
-                crate::ShardIndex::calculate_reconstruction_internal_sync(py, &file_hash_hex, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true), file_info2)
+                crate::ShardIndex::calculate_reconstruction_internal_sync(py, start_byte, end_byte, xorb_footers, coalesce.unwrap_or(true), file_info2)
             })
         })
     }
@@ -592,30 +583,17 @@ impl ShardIndex {
                     .map(|(url, b_start, b_end, unpacked_size)| {
                         let client = client.clone();
                         async move {
-                            // Fetch the exact byte range
-                            let resp = client.get(&url)
-                                .header("Range", format!("bytes={}-{}", b_start, b_end))
-                                .send()
-                                .await
-                                .map_err(|e| format!("Fetch failed for {}: {}", url, e))?;
-                            
-                            let mut decompressed = Vec::new();
-                            let mut writer = std::io::Cursor::new(&mut decompressed);
-                            
-                            let mut stream_reader = resp.bytes_stream()
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                                .into_async_read();
-                                
-                            let mut total_unpacked = 0u32;
-                            while total_unpacked < unpacked_size {
-                                let (_, unpacked_len) = mdb_shard::xorb_object::deserialize_async::deserialize_chunk_to_writer(&mut stream_reader, &mut writer).await
-                                    .map_err(|e| format!("Decompression failed: {:?}", e))?;
-                                total_unpacked += unpacked_len;
-                            }
-                            Ok(decompressed)
+                            reqwest_download_and_decompress_range_with_retry(
+                                &client,
+                                &url,
+                                b_start,
+                                b_end,
+                                unpacked_size,
+                                MAX_S3_ATTEMPTS,
+                            ).await
                         }
                     })
-                    .buffered(32) // Limit concurrency to 32 requests per batch
+                    .buffered(MAX_CONCURRENCY)
                     .collect::<Vec<Result<Vec<u8>, String>>>()
                     .await;
             }
@@ -757,7 +735,7 @@ impl ShardIndex {
         // 2. Query XORB chunks from GC_XORB_CHUNKS_TABLE and stream chunks to live tables
         let mut chunks_to_insert: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(10000);
 
-        let mut flush_chunks = |chunks: &mut Vec<([u8; 32], [u8; 32])>| -> PyResult<()> {
+        let flush_chunks = |chunks: &mut Vec<([u8; 32], [u8; 32])>| -> PyResult<()> {
             if chunks.is_empty() { return Ok(()); }
             let write_txn = gc_db.begin_write()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
@@ -898,7 +876,7 @@ impl ShardIndex {
         let mut util_entries = Vec::with_capacity(10000);
         let mut sparse_entries = Vec::with_capacity(10000);
 
-        let mut flush_utilization = |utils: &mut Vec<([u8; 32], String)>, sparses: &mut Vec<[u8; 32]>| -> PyResult<()> {
+        let flush_utilization = |utils: &mut Vec<([u8; 32], String)>, sparses: &mut Vec<[u8; 32]>| -> PyResult<()> {
             if utils.is_empty() && sparses.is_empty() { return Ok(()); }
             let write_txn = gc_db.begin_write()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
@@ -1038,7 +1016,6 @@ impl ShardIndex {
 impl ShardIndex {
     pub fn calculate_reconstruction_internal_sync(
         py: Python<'_>,
-        file_hash_hex: &str,
         start_byte: Option<u64>,
         end_byte: Option<u64>,
         xorb_footers: std::collections::HashMap<MerkleHash, Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)>>,

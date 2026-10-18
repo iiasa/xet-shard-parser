@@ -4262,6 +4262,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "bytes",
  "futures",
  "pyo3",
  "pyo3-asyncio",

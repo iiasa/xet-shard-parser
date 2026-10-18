@@ -1,32 +1,23 @@
 use pyo3::prelude::*;
 use redb::ReadableTableMetadata;
-use std::collections::{HashSet, HashMap};
+use std::collections::HashSet;
 use std::io::Cursor;
-use reqwest::Client as ReqwestClient;
 use tokio::runtime::Runtime;
 use std::sync::Arc;
-use futures::future::join_all;
-use aws_sdk_s3::Client;
-use aws_config::Region;
-use aws_sdk_s3::config::Credentials;
 
-macro_rules! s3_retry {
-    ($max_attempts:expr, $block:block) => {{
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            match $block.await {
-                Ok(val) => break Ok(val),
-                Err(e) => {
-                    if attempts >= $max_attempts {
-                        break Err(e);
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
-                }
-            }
-        }
-    }};
-}
+use crate::s3_client::{
+    create_s3_client,
+    s3_download_object,
+    s3_download_range,
+    s3_check_exists,
+    s3_put_object,
+    s3_copy_object,
+    s3_delete_object,
+    s3_list_objects_v2,
+    s3_upload_file_reqwest_http1,
+    MAX_S3_ATTEMPTS,
+    MAX_CONCURRENCY,
+};
 
 use mdb_shard::merklehash::{MerkleHash, compute_data_hash};
 use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
@@ -97,12 +88,10 @@ pub fn _consolidate_metadata(
     let rt = Runtime::new().unwrap();
 
     // 0. S3 Network Setup
-    let (client, bucket) = _setup_s3_client()?;
+    let (client, bucket) = create_s3_client()?;
 
     // Bin-Packing State
     let max_xorb_size = 64 * 1024 * 1024; // 64 MB target
-    // Buffer State
-
     // Buffer State
     let mut xorb_new_chunks: Vec<u8> = Vec::new();
     let mut new_entries: Vec<XorbChunkSequenceEntry> = Vec::new();
@@ -130,7 +119,7 @@ pub fn _consolidate_metadata(
     let sparse_xorbs = read_txn.open_table(GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
 
     // A closure to flush the current buffer to S3
-    let mut flush_xorb_buffer = |chunks: &mut Vec<u8>, entries: &mut Vec<XorbChunkSequenceEntry>, hashes: &mut Vec<MerkleHash>, offset: &mut u32, unp_size: &mut u32, map_table: &mut redb::Table<&[u8; 32], &[u8; 36]>, xorbs_table: &mut redb::Table<&str, &[u8]>| -> PyResult<()> {
+    let flush_xorb_buffer = |chunks: &mut Vec<u8>, entries: &mut Vec<XorbChunkSequenceEntry>, hashes: &mut Vec<MerkleHash>, offset: &mut u32, unp_size: &mut u32, map_table: &mut redb::Table<&[u8; 32], &[u8; 36]>, xorbs_table: &mut redb::Table<&str, &[u8]>| -> PyResult<()> {
         if chunks.is_empty() { return Ok(()); }
         
         let mut xorb_new_full = Vec::new();
@@ -160,13 +149,8 @@ pub fn _consolidate_metadata(
         // Stream XORB natively
         rt.block_on(async {
             let key = format!("gc_consolidated/xorbs/{}", new_xorb_hash_str);
-            s3_retry!(5, {
-                client.put_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(xorb_new_full.clone()))
-                    .send()
-            }).map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
+            s3_put_object(&client, &bucket, &key, xorb_new_full.clone(), MAX_S3_ATTEMPTS).await
+                .map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
 
@@ -221,7 +205,7 @@ pub fn _consolidate_metadata(
                     let xorb_hash = MerkleHash::from(hash_bytes);
                     let xorb_hash_str = xorb_hash.hex();
                     let key = format!("xorbs/default/{}", xorb_hash_str);
-                    let footer_bytes_result = download_range_with_retry(&client, &bucket, &key, "bytes=-1048576", 5).await;
+                    let footer_bytes_result = s3_download_range(&client, &bucket, &key, "bytes=-1048576", MAX_S3_ATTEMPTS, true).await;
                     (hash_bytes, footer_bytes_result)
                 }
             });
@@ -304,7 +288,7 @@ pub fn _consolidate_metadata(
                 let range_header = format!("bytes={}-{}", req.start, req.end - 1);
                 
                 range_futures.push(async move {
-                    let bytes_result = download_range_with_retry(&client, &bucket, &key, &range_header, 5).await;
+                    let bytes_result = s3_download_range(&client, &bucket, &key, &range_header, MAX_S3_ATTEMPTS, true).await;
                     (req, bytes_result)
                 });
             }
@@ -351,7 +335,7 @@ pub fn _consolidate_metadata(
     let max_shard_size: u64 = 64 * 1024 * 1024; // 64 MB target
     let mut unwritten_files = 0;
 
-    let mut flush_shard = |shard_mem: &mut MDBInMemoryShard, new_shards_table: &mut redb::Table<&str, ()>, added_xorbs: &mut HashSet<MerkleHash>| -> PyResult<()> {
+    let flush_shard = |shard_mem: &mut MDBInMemoryShard, new_shards_table: &mut redb::Table<&str, ()>, added_xorbs: &mut HashSet<MerkleHash>| -> PyResult<()> {
         let shard_bytes = shard_mem.to_bytes()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
         
@@ -360,13 +344,8 @@ pub fn _consolidate_metadata(
         
         rt.block_on(async {
             let key = format!("gc_consolidated/shards/{}.mdb", new_shard_hash_str);
-            s3_retry!(5, {
-                client.put_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(shard_bytes.clone()))
-                    .send()
-            }).map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
+            s3_put_object(&client, &bucket, &key, shard_bytes.clone(), MAX_S3_ATTEMPTS).await
+                .map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
         
@@ -507,7 +486,8 @@ pub fn _consolidate_metadata(
     // Stream the final REDB lock file up to S3
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await.map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
+        s3_upload_file_reqwest_http1(&client, &bucket, key, txn_path, MAX_S3_ATTEMPTS).await
+            .map_err(|e| format!("Failed to put {}: {:?}", key, e))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
@@ -516,149 +496,14 @@ pub fn _consolidate_metadata(
     Ok(())
 }
 
-async fn upload_file_reqwest_http1(client: &Client, bucket: &str, key: &str, file_path: &str) -> Result<(), String> {
-    let presigned = client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .presigned(aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(300)).map_err(|e| format!("{:?}", e))?)
-        .await
-        .map_err(|e| format!("Presigning failed for {}: {:?}", key, e))?;
-        
-    let reqwest_client = ReqwestClient::builder()
-        .http1_only()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| format!("Reqwest init failed: {:?}", e))?;
-        
-    let file_data = tokio::fs::read(file_path).await.map_err(|e| format!("Failed to read file {file_path}: {:?}", e))?;
-    let size = file_data.len();
-    
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        eprintln!("[GC Upload] Uploading {} ({:.2} MB, attempt {}/5)...", key, size as f64 / (1024.0 * 1024.0), attempts);
-        let body = reqwest::Body::from(file_data.clone());
-        
-        let request = reqwest_client.put(presigned.uri().to_string())
-            .header("Content-Length", size.to_string())
-            .body(body);
-            
-        match request.send().await {
-            Ok(r) if r.status().is_success() => {
-                eprintln!("[GC Upload] Successfully uploaded {} ({} bytes)", key, size);
-                return Ok(());
-            }
-            Ok(r) => {
-                let status = r.status();
-                let text = r.text().await.unwrap_or_default();
-                let err = format!("HTTP {}: {}", status, text);
-                eprintln!("[GC Upload] Attempt {} failed for {}: {}", attempts, key, err);
-                if attempts >= 5 {
-                    return Err(format!("Failed to put {}: {}", key, err));
-                }
-            }
-            Err(e) => {
-                eprintln!("[GC Upload] Attempt {} network error for {}: {:?}", attempts, key, e);
-                if attempts >= 5 {
-                    return Err(format!("Reqwest error putting {}: {:?}", key, e));
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
-    }
-}
-
-fn _setup_s3_client() -> PyResult<(Client, String)> {
-    let endpoint = std::env::var("XET_CAS_S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string());
-    let access_key = std::env::var("XET_CAS_S3_API_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    let secret_key = std::env::var("XET_CAS_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-    let region = std::env::var("XET_CAS_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-    let bucket = std::env::var("XET_CAS_S3_BUCKET_NAME").unwrap_or_else(|_| "xet-cas".to_string());
-
-    let credentials = Credentials::new(access_key, secret_key, None, None, "xet_janitor");
-    let retry_config = aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(5);
-    let config = aws_sdk_s3::Config::builder()
-        .behavior_version(aws_config::BehaviorVersion::latest())
-        .retry_config(retry_config)
-        .credentials_provider(credentials)
-        .region(aws_config::Region::new(region))
-        .endpoint_url(&endpoint)
-        .force_path_style(true)
-        .build();
-
-    Ok((Client::from_conf(config), bucket))
-}
-
-async fn download_with_retry(client: &Client, bucket: &str, key: &str, max_attempts: u32) -> Result<Option<Vec<u8>>, String> {
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match client.get_object().bucket(bucket).key(key).send().await {
-            Ok(resp) => {
-                match resp.body.collect().await {
-                    Ok(data) => return Ok(Some(data.into_bytes().to_vec())),
-                    Err(e) => {
-                        if attempts >= max_attempts {
-                            return Err(format!("Failed to collect {}: {:?}", key, e));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
-                    }
-                }
-            }
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("NoSuchKey") || err_str.contains("NotFound") {
-                    return Ok(None);
-                }
-                if attempts >= max_attempts {
-                    return Err(format!("Failed to get {}: {}", key, err_str));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
-            }
-        }
-    }
-}
-
-
-async fn download_range_with_retry(client: &Client, bucket: &str, key: &str, range_header: &str, max_attempts: u32) -> Result<Option<Vec<u8>>, String> {
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match client.get_object().bucket(bucket).key(key).range(range_header).send().await {
-            Ok(resp) => {
-                match resp.body.collect().await {
-                    Ok(data) => return Ok(Some(data.into_bytes().to_vec())),
-                    Err(e) => {
-                        if attempts >= max_attempts {
-                            return Err(format!("Failed to collect {}: {:?}", key, e));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
-                    }
-                }
-            }
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("NoSuchKey") || err_str.contains("NotFound") {
-                    return Ok(None);
-                }
-                if attempts >= max_attempts {
-                    return Err(format!("Failed to get {}: {}", key, err_str));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
-            }
-        }
-    }
-}
-
 pub fn _stage_gc_transaction() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
-    let (client, bucket) = _setup_s3_client()?;
+    let (client, bucket) = create_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = download_with_retry(&client, &bucket, key, 5).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
@@ -690,7 +535,7 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
                 let hash = hash_key.value();
                 let src = format!("{}/gc_consolidated/xorbs/{}", bucket, hash);
                 let dest = format!("xorbs/default/{}", hash);
-                client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await
+                s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, false).await
                     .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))?;
             }
             // Copy Shards
@@ -699,12 +544,12 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
                 let hash = hash_key.value();
                 let src = format!("{}/gc_consolidated/shards/{}.mdb", bucket, hash);
                 let dest = format!("shards/{}.mdb", hash);
-                client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await
+                s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, false).await
                     .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))?;
                 
                 // Delete any existing tombstone for this new shard (resurrection)
                 let tombstone_key = format!("shards/tombstones/{}.revoked", hash);
-                let _ = client.delete_object().bucket(&bucket).key(&tombstone_key).send().await;
+                let _ = s3_delete_object(&client, &bucket, &tombstone_key, MAX_S3_ATTEMPTS).await;
             }
             
             // Tombstone and move old shards
@@ -715,23 +560,14 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
                 // Move old shard to bin
                 let src = format!("{}/shards/{}.mdb", bucket, hash_str);
                 let dest = format!("bin/shards/{}.mdb", hash_str);
-                if let Err(e) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
-                    // Ignore 404s if it was already moved
-                    if !format!("{:?}", e).contains("NotFound") && !format!("{:?}", e).contains("NoSuchKey") {
-                        return Err(format!("Copy failed for {}: {:?}", hash_str, e));
-                    }
-                } else {
-                    let key_to_del = format!("shards/{}.mdb", hash_str);
-                    let _ = client.delete_object().bucket(&bucket).key(&key_to_del).send().await;
-                }
+                s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, true).await
+                    .map_err(|e| format!("Copy failed for {}: {:?}", hash_str, e))?;
+                let key_to_del = format!("shards/{}.mdb", hash_str);
+                let _ = s3_delete_object(&client, &bucket, &key_to_del, MAX_S3_ATTEMPTS).await;
 
                 // Create tombstone
                 let key = format!("shards/tombstones/{}.revoked", hash_str);
-                client.put_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(Vec::new()))
-                    .send().await
+                s3_put_object(&client, &bucket, &key, Vec::new(), MAX_S3_ATTEMPTS).await
                     .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
             }
             
@@ -742,14 +578,10 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
                 
                 let src = format!("{}/xorbs/default/{}", bucket, hash_str);
                 let dest = format!("bin/xorbs/{}", hash_str);
-                if let Err(e) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
-                    if !format!("{:?}", e).contains("NotFound") && !format!("{:?}", e).contains("NoSuchKey") {
-                        return Err(format!("Copy failed for {}: {:?}", hash_str, e));
-                    }
-                } else {
-                    let key_to_del = format!("xorbs/default/{}", hash_str);
-                    let _ = client.delete_object().bucket(&bucket).key(&key_to_del).send().await;
-                }
+                s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, true).await
+                    .map_err(|e| format!("Copy failed for {}: {:?}", hash_str, e))?;
+                let key_to_del = format!("xorbs/default/{}", hash_str);
+                let _ = s3_delete_object(&client, &bucket, &key_to_del, MAX_S3_ATTEMPTS).await;
             }
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -762,33 +594,13 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await
+        s3_upload_file_reqwest_http1(&client, &bucket, key, txn_path, MAX_S3_ATTEMPTS).await
             .map_err(|e| format!("Failed to upload staged lock: {e}"))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
     Ok(())
-}
-
-async fn check_exists_with_retry(client: &Client, bucket: &str, key: &str, max_attempts: u32) -> Result<bool, String> {
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match client.head_object().bucket(bucket).key(key).send().await {
-            Ok(_) => return Ok(true),
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                    return Ok(false);
-                }
-                if attempts >= max_attempts {
-                    return Err(format!("Network error checking {}: {}", key, err_str));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis((500 * attempts) as u64)).await;
-            }
-        }
-    }
 }
 
 fn _verify_pre_gc_transaction(
@@ -858,41 +670,43 @@ fn _verify_pre_gc_transaction(
     let mut missing_xorbs_table = write_txn.open_table(TXN_MISSING_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
     let mut batch = Vec::with_capacity(100);
-    let mut process_batch = |b: &mut Vec<String>| {
+    let mut process_batch = |b: &mut Vec<String>| -> PyResult<()> {
         let results = rt.block_on(async {
             let futures_iter = b.iter().map(|xorb_hash_hex| {
                 let client = client.clone();
-                let bucket = bucket.clone();
+                let bucket = bucket.to_string();
                 let xh = xorb_hash_hex.clone();
                 async move {
                     let key_staged = format!("gc_consolidated/xorbs/{}", xh);
                     let key_live = format!("xorbs/default/{}", xh);
                     
-                    let staged = check_exists_with_retry(&client, &bucket, &key_staged, 5).await.unwrap_or(true);
+                    let staged = s3_check_exists(&client, &bucket, &key_staged, MAX_S3_ATTEMPTS).await?;
                     if staged {
-                        return (xh, true);
+                        return Ok((xh, true));
                     }
-                    let live = check_exists_with_retry(&client, &bucket, &key_live, 5).await.unwrap_or(true);
+                    let live = s3_check_exists(&client, &bucket, &key_live, MAX_S3_ATTEMPTS).await?;
                     if live {
-                        return (xh, true);
+                        return Ok((xh, true));
                     }
-                    (xh, false)
+                    Ok((xh, false))
                 }
             });
             
             iter(futures_iter)
-                .buffer_unordered(100)
-                .collect::<Vec<(String, bool)>>()
+                .buffer_unordered(MAX_CONCURRENCY)
+                .collect::<Vec<Result<(String, bool), String>>>()
                 .await
         });
         
-        for (xh, exists) in results {
+        for item in results {
+            let (xh, exists) = item.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
             if !exists {
                 eprintln!("[GC Verify PRE] Phase 3: Missing XORB detected: {}", xh);
                 missing_xorbs_table.insert(xh.as_str(), ()).unwrap();
             }
         }
         b.clear();
+        Ok(())
     };
 
     let mut xorbs_scanned = 0;
@@ -900,7 +714,7 @@ fn _verify_pre_gc_transaction(
         let (k, _) = item.unwrap();
         batch.push(k.value().to_string());
         if batch.len() >= 100 {
-            process_batch(&mut batch);
+            process_batch(&mut batch)?;
             xorbs_scanned += 100;
             if xorbs_scanned % 1000 == 0 {
                 eprintln!("[GC Verify PRE] Phase 3: Verified {} XORBs (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
@@ -908,7 +722,7 @@ fn _verify_pre_gc_transaction(
         }
     }
     if !batch.is_empty() {
-        process_batch(&mut batch);
+        process_batch(&mut batch)?;
     }
     
     // 4. Second pass to stream files and check for missing XORB intersections
@@ -1014,7 +828,7 @@ fn _verify_post_gc_transaction(
     eprintln!("[GC Verify POST] Phase 1: Downloading and registering {} new shards", new_shards.len());
     for ns in &new_shards {
         let key = format!("gc_consolidated/shards/{}.mdb", ns);
-        let data = rt.block_on(async { download_with_retry(client, bucket, &key, 5).await })
+        let data = rt.block_on(async { s3_download_object(client, bucket, &key, MAX_S3_ATTEMPTS).await })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Missing new shard: {}", key)))?;
         
@@ -1079,31 +893,36 @@ fn _verify_post_gc_transaction(
     let mut missing_xorbs_table = write_txn.open_table(redb::TableDefinition::<&str, ()>::new("txn_missing_post_xorbs")).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
     let mut batch = Vec::with_capacity(100);
-    let mut process_batch = |b: &mut Vec<String>| {
+    let mut process_batch = |b: &mut Vec<String>| -> PyResult<()> {
         let results = rt.block_on(async {
             let futures_iter = b.iter().map(|xorb_hash_hex| {
                 let client = client.clone();
-                let bucket = bucket.clone();
+                let bucket = bucket.to_string();
                 let xh = xorb_hash_hex.clone();
                 async move {
                     let key_staged = format!("gc_consolidated/xorbs/{}", xh);
                     let key_live = format!("xorbs/default/{}", xh);
-                    let staged = check_exists_with_retry(&client, &bucket, &key_staged, 5).await.unwrap_or(true);
-                    if staged { return (xh, true); }
-                    let live = check_exists_with_retry(&client, &bucket, &key_live, 5).await.unwrap_or(true);
-                    if live { return (xh, true); }
-                    (xh, false)
+                    let staged = s3_check_exists(&client, &bucket, &key_staged, MAX_S3_ATTEMPTS).await?;
+                    if staged { return Ok((xh, true)); }
+                    let live = s3_check_exists(&client, &bucket, &key_live, MAX_S3_ATTEMPTS).await?;
+                    if live { return Ok((xh, true)); }
+                    Ok((xh, false))
                 }
             });
-            iter(futures_iter).buffer_unordered(100).collect::<Vec<(String, bool)>>().await
+            iter(futures_iter)
+                .buffer_unordered(MAX_CONCURRENCY)
+                .collect::<Vec<Result<(String, bool), String>>>()
+                .await
         });
         
-        for (xh, exists) in results {
+        for item in results {
+            let (xh, exists) = item.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
             if !exists {
                 missing_xorbs_table.insert(xh.as_str(), ()).unwrap();
             }
         }
         b.clear();
+        Ok(())
     };
 
     let mut xorbs_scanned = 0;
@@ -1111,12 +930,15 @@ fn _verify_post_gc_transaction(
         let (k, _) = item.unwrap();
         batch.push(k.value().to_string());
         if batch.len() >= 100 {
-            process_batch(&mut batch);
+            process_batch(&mut batch)?;
             xorbs_scanned += 100;
+            if xorbs_scanned % 1000 == 0 {
+                eprintln!("[GC Verify POST] Phase 3: Verified {} XORBs (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
+            }
         }
     }
     if !batch.is_empty() {
-        process_batch(&mut batch);
+        process_batch(&mut batch)?;
     }
     
     eprintln!("[GC Verify POST] Phase 4: Resolving missing files for missing XORBs...");
@@ -1172,12 +994,12 @@ pub fn _verify_gc_transaction(
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
 ) -> PyResult<usize> {
     let rt = Runtime::new().unwrap();
-    let (client, bucket) = _setup_s3_client()?;
+    let (client, bucket) = create_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = download_with_retry(&client, &bucket, key, 5).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
@@ -1187,7 +1009,7 @@ pub fn _verify_gc_transaction(
     let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
     
     {
-        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        let meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let status_str = {
             let status = meta.get("status").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
             status.unwrap().value().to_string()
@@ -1221,7 +1043,7 @@ pub fn _verify_gc_transaction(
     eprintln!("[GC Verify] Phase 6: Uploading active_transaction.redb to S3 (RSS: {} MB)...", get_current_rss_mb());
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await
+        s3_upload_file_reqwest_http1(&client, &bucket, key, txn_path, MAX_S3_ATTEMPTS).await
             .map_err(|e| format!("Failed to upload verified lock: {e}"))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -1232,12 +1054,12 @@ pub fn _verify_gc_transaction(
 
 pub fn _commit_gc_transaction() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
-    let (client, bucket) = _setup_s3_client()?;
+    let (client, bucket) = create_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = download_with_retry(&client, &bucket, key, 5).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
@@ -1264,7 +1086,7 @@ pub fn _commit_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await
+        s3_upload_file_reqwest_http1(&client, &bucket, key, txn_path, MAX_S3_ATTEMPTS).await
             .map_err(|e| format!("Failed to upload committed lock: {e}"))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -1275,12 +1097,12 @@ pub fn _commit_gc_transaction() -> PyResult<()> {
 
 pub fn _revert_gc_transaction() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
-    let (client, bucket) = _setup_s3_client()?;
+    let (client, bucket) = create_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = download_with_retry(&client, &bucket, key, 5).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
@@ -1310,14 +1132,10 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
                 let hash_str = hash_key.value();
                 
                 let active_key = format!("shards/{}.mdb", hash_str);
-                let _ = client.delete_object().bucket(&bucket).key(&active_key).send().await;
+                let _ = s3_delete_object(&client, &bucket, &active_key, MAX_S3_ATTEMPTS).await;
                 
                 let key = format!("shards/tombstones/{}.revoked", hash_str);
-                client.put_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(Vec::new()))
-                    .send().await
+                s3_put_object(&client, &bucket, &key, Vec::new(), MAX_S3_ATTEMPTS).await
                     .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
             }
             
@@ -1325,7 +1143,7 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
                 let (hash_key, _) = item.unwrap();
                 let hash_str = hash_key.value();
                 let active_key = format!("xorbs/default/{}", hash_str);
-                let _ = client.delete_object().bucket(&bucket).key(&active_key).send().await;
+                let _ = s3_delete_object(&client, &bucket, &active_key, MAX_S3_ATTEMPTS).await;
             }
             
             // Delete tombstones for old shards (resurrection) and move back from bin
@@ -1334,13 +1152,13 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
                 let hash_str = hash_key.value();
                 
                 let key = format!("shards/tombstones/{}.revoked", hash_str);
-                let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+                let _ = s3_delete_object(&client, &bucket, &key, MAX_S3_ATTEMPTS).await;
                 
                 let src = format!("{}/bin/shards/{}.mdb", bucket, hash_str);
                 let dest = format!("shards/{}.mdb", hash_str);
-                if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                if let Ok(_) = s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, true).await {
                     let bin_key = format!("bin/shards/{}.mdb", hash_str);
-                    let _ = client.delete_object().bucket(&bucket).key(&bin_key).send().await;
+                    let _ = s3_delete_object(&client, &bucket, &bin_key, MAX_S3_ATTEMPTS).await;
                 }
             }
 
@@ -1350,9 +1168,9 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
                 
                 let src = format!("{}/bin/xorbs/{}", bucket, hash_str);
                 let dest = format!("xorbs/default/{}", hash_str);
-                if let Ok(_) = client.copy_object().copy_source(&src).bucket(&bucket).key(&dest).send().await {
+                if let Ok(_) = s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, true).await {
                     let bin_key = format!("bin/xorbs/{}", hash_str);
-                    let _ = client.delete_object().bucket(&bucket).key(&bin_key).send().await;
+                    let _ = s3_delete_object(&client, &bucket, &bin_key, MAX_S3_ATTEMPTS).await;
                 }
             }
             Ok::<_, String>(())
@@ -1366,7 +1184,7 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        upload_file_reqwest_http1(&client, &bucket, key, txn_path).await
+        s3_upload_file_reqwest_http1(&client, &bucket, key, txn_path, MAX_S3_ATTEMPTS).await
             .map_err(|e| format!("Failed to upload reverted lock: {e}"))?;
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -1377,25 +1195,21 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
 
 pub fn _prune_garbage() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
-    let (client, bucket) = _setup_s3_client()?;
+    let (client, bucket) = create_s3_client()?;
     
     rt.block_on(async {
         // Delete everything in bin/ and gc_consolidated/ immediately
         for prefix in &["bin/", "gc_consolidated/"] {
-            let mut continuation_token = None;
+            let mut continuation_token: Option<String> = None;
             loop {
-                let mut req = client.list_objects_v2().bucket(&bucket).prefix(*prefix);
-                if let Some(token) = continuation_token {
-                    req = req.continuation_token(token);
-                }
-                let resp = match req.send().await {
+                let resp = match s3_list_objects_v2(&client, &bucket, prefix, continuation_token.as_deref(), MAX_S3_ATTEMPTS).await {
                     Ok(r) => r,
                     Err(_) => break,
                 };
                 
                 for obj in resp.contents() {
                     if let Some(key) = obj.key() {
-                        let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+                        let _ = s3_delete_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await;
                     }
                 }
                 
@@ -1410,13 +1224,9 @@ pub fn _prune_garbage() -> PyResult<()> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         let seven_days = 7 * 24 * 60 * 60;
         
-        let mut continuation_token = None;
+        let mut continuation_token: Option<String> = None;
         loop {
-            let mut req = client.list_objects_v2().bucket(&bucket).prefix("shards/tombstones/");
-            if let Some(token) = continuation_token {
-                req = req.continuation_token(token);
-            }
-            let resp = match req.send().await {
+            let resp = match s3_list_objects_v2(&client, &bucket, "shards/tombstones/", continuation_token.as_deref(), MAX_S3_ATTEMPTS).await {
                 Ok(r) => r,
                 Err(_) => break,
             };
@@ -1429,9 +1239,9 @@ pub fn _prune_garbage() -> PyResult<()> {
                                 let file_name = key.split('/').last().unwrap();
                                 let hash_str = file_name.strip_suffix(".revoked").unwrap();
                                 let shard_key = format!("shards/{}.mdb", hash_str);
-                                let _ = client.delete_object().bucket(&bucket).key(&shard_key).send().await;
+                                let _ = s3_delete_object(&client, &bucket, &shard_key, MAX_S3_ATTEMPTS).await;
                             }
-                            let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+                            let _ = s3_delete_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await;
                         }
                     }
                 }
@@ -1448,7 +1258,7 @@ pub fn _prune_garbage() -> PyResult<()> {
         let lock_key = "gc/active_transaction.redb";
         
         let mut should_delete = false;
-        if let Ok(Some(data)) = download_with_retry(&client, &bucket, lock_key, 5).await {
+        if let Ok(Some(data)) = s3_download_object(&client, &bucket, lock_key, MAX_S3_ATTEMPTS).await {
             if let Ok(_) = std::fs::write(txn_path, &data) {
                 if let Ok(db) = Database::open(txn_path) {
                     if let Ok(read_txn) = db.begin_read() {
@@ -1466,7 +1276,7 @@ pub fn _prune_garbage() -> PyResult<()> {
         }
         
         if should_delete {
-            let _ = client.delete_object().bucket(&bucket).key(lock_key).send().await;
+            let _ = s3_delete_object(&client, &bucket, lock_key, MAX_S3_ATTEMPTS).await;
             let _ = std::fs::remove_file(txn_path);
         }
 
@@ -1478,12 +1288,12 @@ pub fn _prune_garbage() -> PyResult<()> {
 
 pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
     let rt = Runtime::new().unwrap();
-    let (client, bucket) = _setup_s3_client()?;
+    let (client, bucket) = create_s3_client()?;
     let txn_path = format!("/tmp/active_transaction_explore_{}.redb", std::process::id());
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = download_with_retry(&client, &bucket, key, 5).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(&txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
