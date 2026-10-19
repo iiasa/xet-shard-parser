@@ -939,7 +939,7 @@ impl ShardIndex {
                     utilization, live_bytes, total_bytes, dead_chunks_json);
 
                 util_entries.push((xorb_h_bytes, json_str));
-                if utilization <= sparse_threshold {
+                if utilization > 0.0 && utilization <= sparse_threshold {
                     sparse_entries.push(xorb_h_bytes);
                 }
                 
