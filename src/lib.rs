@@ -30,6 +30,7 @@ const GC_PRIMARY_XORB_TABLE: redb::TableDefinition<&[u8; 32], &[u8; 32]> = redb:
 const GC_XORB_UTILIZATION_TABLE: redb::TableDefinition<&[u8; 32], &str> = redb::TableDefinition::new("gc_xorb_utilization");
 const GC_SPARSE_XORBS_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_sparse_xorbs");
 const GC_LIVE_FILES_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_live_files");
+const GC_LIVE_XORBS_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_live_xorbs");
 const GC_XORB_CHUNKS_TABLE: redb::TableDefinition<&[u8; 32], &[u8]> = redb::TableDefinition::new("gc_xorb_chunks");
 
 fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Vec<u32>)> {
@@ -644,6 +645,8 @@ impl ShardIndex {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open GC_SPARSE_XORBS_TABLE: {e}")))?;
             let _ = write_txn.open_table(GC_LIVE_FILES_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open GC_LIVE_FILES_TABLE: {e}")))?;
+            let _ = write_txn.open_table(GC_LIVE_XORBS_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open GC_LIVE_XORBS_TABLE: {e}")))?;
 
             let mut xorb_chunks_table = write_txn.open_table(GC_XORB_CHUNKS_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open GC_XORB_CHUNKS_TABLE: {e}")))?;
@@ -654,7 +657,9 @@ impl ShardIndex {
                 })
             }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
 
-            for shard_file in shards {
+            let mut missing_xorb_info: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
+            for shard_file in &shards {
                 let mut reader = match shard_file.get_reader() {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -684,6 +689,77 @@ impl ShardIndex {
                                 chunk_bytes.extend_from_slice(&chunk.unpacked_segment_bytes.to_le_bytes());
                             }
                             let _ = xorb_chunks_table.insert(&xorb_h_bytes, chunk_bytes.as_slice());
+                        }
+                    }
+                }
+            }
+
+            // Second pass: find any XORBs referenced by file segments whose MDBXorbInfo block was omitted in an earlier GC run
+            for shard_file in &shards {
+                let mut reader = match shard_file.get_reader() {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let m_shard = match MDBMinimalShard::from_reader(&mut reader, true, false) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                for i in 0..m_shard.num_files() {
+                    if let Some(file_view) = m_shard.file(i) {
+                        let file_info = mdb_shard::metadata_shard::file_structs::MDBFileInfo::from(file_view);
+                        for seg in &file_info.segments {
+                            let xorb_h_bytes: [u8; 32] = seg.xorb_hash.into();
+                            if xorb_chunks_table.get(&xorb_h_bytes).unwrap_or(None).is_none() {
+                                missing_xorb_info.insert(xorb_h_bytes);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !missing_xorb_info.is_empty() {
+                if let Ok((s3_client, bucket)) = crate::s3_client::create_s3_client() {
+                    let missing_vec: Vec<[u8; 32]> = missing_xorb_info.into_iter().collect();
+                    let recovered = py.allow_threads(|| {
+                        self.rt.block_on(async {
+                            use futures::stream::{StreamExt, iter};
+                            let futures_iter = missing_vec.into_iter().map(|xorb_h_bytes| {
+                                let client = s3_client.clone();
+                                let bucket = bucket.clone();
+                                async move {
+                                    let xorb_h = MerkleHash::from(xorb_h_bytes);
+                                    let key = format!("xorbs/default/{}", xorb_h.hex());
+                                    let res = crate::s3_client::s3_download_range(&client, &bucket, &key, "bytes=-1048576", MAX_S3_ATTEMPTS, false).await;
+                                    (xorb_h_bytes, res)
+                                }
+                            });
+                            iter(futures_iter).buffer_unordered(MAX_CONCURRENCY).collect::<Vec<_>>().await
+                        })
+                    });
+
+                    for (xorb_h_bytes, res) in recovered {
+                        if let Ok(Some(footer_bytes)) = res {
+                            if let Some((hashes, boundaries, unpacked)) = parse_xorb_footer_data(&footer_bytes) {
+                                let num_entries = hashes.len();
+                                let mut chunk_bytes = Vec::with_capacity(num_entries * 40);
+                                for j in 0..num_entries {
+                                    let packed_length = if j == 0 {
+                                        boundaries[0]
+                                    } else {
+                                        boundaries[j].saturating_sub(boundaries[j - 1])
+                                    };
+                                    let unpacked_segment_bytes = if j == 0 {
+                                        unpacked[0]
+                                    } else {
+                                        unpacked[j].saturating_sub(unpacked[j - 1])
+                                    };
+                                    let chunk_h_bytes: [u8; 32] = hashes[j].into();
+                                    chunk_bytes.extend_from_slice(&chunk_h_bytes);
+                                    chunk_bytes.extend_from_slice(&packed_length.to_le_bytes());
+                                    chunk_bytes.extend_from_slice(&unpacked_segment_bytes.to_le_bytes());
+                                }
+                                let _ = xorb_chunks_table.insert(&xorb_h_bytes, chunk_bytes.as_slice());
+                            }
                         }
                     }
                 }
@@ -734,9 +810,10 @@ impl ShardIndex {
 
         // 2. Query XORB chunks from GC_XORB_CHUNKS_TABLE and stream chunks to live tables
         let mut chunks_to_insert: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(10000);
+        let mut xorbs_to_insert: Vec<[u8; 32]> = Vec::with_capacity(1000);
 
-        let flush_chunks = |chunks: &mut Vec<([u8; 32], [u8; 32])>| -> PyResult<()> {
-            if chunks.is_empty() { return Ok(()); }
+        let flush_chunks = |chunks: &mut Vec<([u8; 32], [u8; 32])>, xorbs: &mut Vec<[u8; 32]>| -> PyResult<()> {
+            if chunks.is_empty() && xorbs.is_empty() { return Ok(()); }
             let write_txn = gc_db.begin_write()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
             {
@@ -744,9 +821,15 @@ impl ShardIndex {
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
                 let mut primary_table = write_txn.open_table(GC_PRIMARY_XORB_TABLE)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
+                let mut live_xorbs_table = write_txn.open_table(GC_LIVE_XORBS_TABLE)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
 
+                for xorb_h in xorbs.iter() {
+                    let _ = live_xorbs_table.insert(xorb_h, &());
+                }
                 for (chunk_h, xorb_h) in chunks.iter() {
                     let _ = live_table.insert(chunk_h, &());
+                    let _ = live_xorbs_table.insert(xorb_h, &());
                     if primary_table.get(chunk_h).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?.is_none() {
                         let _ = primary_table.insert(chunk_h, xorb_h);
                     }
@@ -755,6 +838,7 @@ impl ShardIndex {
             write_txn.commit()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
             chunks.clear();
+            xorbs.clear();
             Ok(())
         };
 
@@ -783,6 +867,7 @@ impl ShardIndex {
 
                 for segment in &file_info.segments {
                     let xorb_h_bytes: [u8; 32] = segment.xorb_hash.into();
+                    xorbs_to_insert.push(xorb_h_bytes);
                     if let Ok(Some(xorb_val)) = xorb_table.get(&xorb_h_bytes) {
                         let bytes = xorb_val.value();
                         let total_entries = bytes.len() / 40;
@@ -796,16 +881,18 @@ impl ShardIndex {
                             chunks_to_insert.push((chunk_h, xorb_h_bytes));
                             
                             if chunks_to_insert.len() >= 10000 {
-                                flush_chunks(&mut chunks_to_insert)?;
+                                flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
                             }
                         }
+                    } else if xorbs_to_insert.len() >= 1000 {
+                        flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
                     }
                 }
             }
         }
 
         // Flush any remaining chunks
-        flush_chunks(&mut chunks_to_insert)?;
+        flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
 
         Ok(())
     }
@@ -907,12 +994,16 @@ impl ShardIndex {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
             let live_chunks_table = read_txn.open_table(GC_LIVE_CHUNKS_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Live chunks table open failed: {e}")))?;
+            let live_xorbs_table = read_txn.open_table(GC_LIVE_XORBS_TABLE)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Live xorbs table open failed: {e}")))?;
 
             for item in xorb_table.iter().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Iter failed: {e}")))? {
                 let (key, val) = item.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read failed: {e}")))?;
                 let xorb_h_bytes = *key.value();
                 let bytes = val.value();
                 let total_entries = bytes.len() / 40;
+
+                let is_xorb_live = live_xorbs_table.get(&xorb_h_bytes).unwrap_or(None).is_some();
 
                 let mut total_bytes: u64 = 0;
                 let mut live_bytes: u64 = 0;
@@ -925,7 +1016,7 @@ impl ShardIndex {
                     let packed_len = u32::from_le_bytes(bytes[offset + 32..offset + 36].try_into().unwrap()) as u64;
 
                     total_bytes += packed_len;
-                    let is_live = live_chunks_table.get(&chunk_h_bytes).unwrap_or(None).is_some();
+                    let is_live = is_xorb_live && live_chunks_table.get(&chunk_h_bytes).unwrap_or(None).is_some();
                     if is_live {
                         live_bytes += packed_len;
                     } else {
@@ -939,7 +1030,7 @@ impl ShardIndex {
                     utilization, live_bytes, total_bytes, dead_chunks_json);
 
                 util_entries.push((xorb_h_bytes, json_str));
-                if utilization > 0.0 && utilization <= sparse_threshold {
+                if utilization <= sparse_threshold {
                     sparse_entries.push(xorb_h_bytes);
                 }
                 

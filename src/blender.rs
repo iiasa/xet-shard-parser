@@ -29,7 +29,9 @@ use redb::{Database, ReadableTable, ReadableDatabase, TableDefinition};
 
 pub const GC_LIVE_FILES_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_live_files");
 pub const GC_LIVE_CHUNKS_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_live_chunks");
+pub const GC_LIVE_XORBS_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_live_xorbs");
 pub const GC_SPARSE_XORBS_TABLE: redb::TableDefinition<&[u8; 32], ()> = redb::TableDefinition::new("gc_sparse_xorbs");
+pub const GC_XORB_CHUNKS_TABLE: redb::TableDefinition<&[u8; 32], &[u8]> = redb::TableDefinition::new("gc_xorb_chunks");
 
 use mdb_shard::metadata_shard::shard_file_reconstructor::FileReconstructor;
 
@@ -84,6 +86,8 @@ pub fn _consolidate_metadata(
     let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
     let live_chunks = read_txn.open_table(GC_LIVE_CHUNKS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
     let live_files = read_txn.open_table(GC_LIVE_FILES_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
+    let live_xorbs = read_txn.open_table(GC_LIVE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
+    let xorb_chunks = read_txn.open_table(GC_XORB_CHUNKS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
 
     let rt = Runtime::new().unwrap();
 
@@ -194,10 +198,21 @@ pub fn _consolidate_metadata(
         batch_idx += 1;
         eprintln!("[GC] Processing sparse XORB batch {}/{} (RSS: {:.1} MB)...", batch_idx, total_batches, get_current_rss_mb());
         
-        // 2a. Fetch Footers Concurrently
+        // 2a. Separate 0%-utilized (dead) XORBs from live sparse XORBs, and fetch footers only for live sparse XORBs
+        let mut live_sparse_chunk = Vec::with_capacity(chunk.len());
+        for hash_bytes in &chunk {
+            if live_xorbs.get(hash_bytes).unwrap().is_some() {
+                live_sparse_chunk.push(*hash_bytes);
+            } else {
+                // 0% utilized XORB: record in old_xorbs_table for stage/revert/prune, skip S3 download
+                let xorb_hash_str = MerkleHash::from(*hash_bytes).hex();
+                old_xorbs_table.insert(xorb_hash_str.as_str(), ()).unwrap();
+            }
+        }
+
         let footer_results = rt.block_on(async {
             use futures::stream::{StreamExt, iter};
-            let futures_iter = chunk.iter().map(|hash_bytes| {
+            let futures_iter = live_sparse_chunk.iter().map(|hash_bytes| {
                 let client = client.clone();
                 let bucket = bucket.clone();
                 let hash_bytes = *hash_bytes;
@@ -383,6 +398,14 @@ pub fn _consolidate_metadata(
                     }
                 }
             }
+            for i in 0..minimal_shard.num_xorb() {
+                if let Some(xorb_view) = minimal_shard.xorb(i) {
+                    let x_bytes: [u8; 32] = xorb_view.xorb_hash().into();
+                    if sparse_xorbs.get(&x_bytes).unwrap().is_some() {
+                        has_sparse = true;
+                    }
+                }
+            }
             
             if !has_sparse {
                 continue;
@@ -392,6 +415,7 @@ pub fn _consolidate_metadata(
             // Note: we don't need to rebuild old_xorb_layouts from the shard because we already 
             // populated layout_table from the S3 fetch.
             
+            let mut existing_xorb_blocks: std::collections::HashMap<MerkleHash, MDBXorbInfo> = std::collections::HashMap::new();
             for i in 0..minimal_shard.num_xorb() {
                 if let Some(xorb_view) = minimal_shard.xorb(i) {
                     let x_hash = xorb_view.xorb_hash();
@@ -399,6 +423,8 @@ pub fn _consolidate_metadata(
                     if sparse_xorbs.get(&x_bytes).unwrap().is_some() {
                         let x_hash_str = x_hash.hex();
                         old_xorbs_table.insert(x_hash_str.as_str(), ()).unwrap();
+                    } else if live_xorbs.get(&x_bytes).unwrap().is_some() {
+                        existing_xorb_blocks.insert(x_hash, MDBXorbInfo::from(xorb_view));
                     }
                 }
             }
@@ -434,7 +460,13 @@ pub fn _consolidate_metadata(
                                         valid = false;
                                         break;
                                     }
+                                } else {
+                                    valid = false;
+                                    break;
                                 }
+                            } else if live_xorbs.get(&seg_hash_bytes).unwrap().is_none() {
+                                valid = false;
+                                break;
                             }
                         }
                         if valid {
@@ -444,6 +476,34 @@ pub fn _consolidate_metadata(
                                     if let Some(xorb_val) = new_xorbs_table.get(x_str.as_str()).unwrap() {
                                         let bytes = xorb_val.value();
                                         if let Ok(Some(xorb_info)) = MDBXorbInfo::deserialize(&mut std::io::Cursor::new(bytes)) {
+                                            current_shard.add_xorb_block(xorb_info)
+                                                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
+                                            added_xorbs.insert(seg.xorb_hash);
+                                        }
+                                    } else if let Some(xorb_info) = existing_xorb_blocks.get(&seg.xorb_hash) {
+                                        current_shard.add_xorb_block(xorb_info.clone())
+                                            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
+                                        added_xorbs.insert(seg.xorb_hash);
+                                    } else {
+                                        let seg_xorb_bytes: [u8; 32] = seg.xorb_hash.into();
+                                        if let Ok(Some(xorb_val)) = xorb_chunks.get(&seg_xorb_bytes) {
+                                            let bytes = xorb_val.value();
+                                            let total_entries = bytes.len() / 40;
+                                            let mut entries = Vec::with_capacity(total_entries);
+                                            let mut offset_acc: u32 = 0;
+                                            for idx in 0..total_entries {
+                                                let base = idx * 40;
+                                                let mut ch_bytes = [0u8; 32];
+                                                ch_bytes.copy_from_slice(&bytes[base..base + 32]);
+                                                let packed_len = u32::from_le_bytes(bytes[base + 32..base + 36].try_into().unwrap());
+                                                let unp_len = u32::from_le_bytes(bytes[base + 36..base + 40].try_into().unwrap());
+                                                entries.push(XorbChunkSequenceEntry::new(MerkleHash::from(ch_bytes), unp_len, offset_acc));
+                                                offset_acc = offset_acc.saturating_add(packed_len);
+                                            }
+                                            let xorb_info = MDBXorbInfo {
+                                                metadata: XorbChunkSequenceHeader::new(seg.xorb_hash, entries.len() as u32, offset_acc),
+                                                chunks: entries,
+                                            };
                                             current_shard.add_xorb_block(xorb_info)
                                                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
                                             added_xorbs.insert(seg.xorb_hash);
