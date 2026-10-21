@@ -738,7 +738,8 @@ impl ShardIndex {
                     });
 
                     for (xorb_h_bytes, res) in recovered {
-                        if let Ok(Some(footer_bytes)) = res {
+                        let footer_opt = res.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
+                        if let Some(footer_bytes) = footer_opt {
                             if let Some((hashes, boundaries, unpacked)) = parse_xorb_footer_data(&footer_bytes) {
                                 let num_entries = hashes.len();
                                 let mut chunk_bytes = Vec::with_capacity(num_entries * 40);

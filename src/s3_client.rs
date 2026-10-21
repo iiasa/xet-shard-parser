@@ -107,12 +107,13 @@ pub fn create_s3_client() -> PyResult<(Client, String)> {
 // AWS SDK S3 Resilient Helpers
 // ============================================================================
 
-/// Downloads a full object, recovering from mid-flight stream dropouts and retrying 404s.
+/// Downloads a full object, recovering from mid-flight stream dropouts and returning immediately on 404.
 pub async fn s3_download_object(
     client: &Client,
     bucket: &str,
     key: &str,
     max_attempts: u32,
+    must_exist: bool,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut attempts = 0;
     loop {
@@ -148,10 +149,10 @@ pub async fn s3_download_object(
             Err(e) => {
                 match classify_get_error(&e) {
                     S3ResponseClassification::ObjectNotFound => {
-                        if attempts >= max_attempts {
-                            return Ok(None);
+                        if must_exist {
+                            return Err(format!("Expected object {} does not exist in S3 (NoSuchKey confirmed)", key));
                         }
-                        tokio::time::sleep(calculate_backoff(attempts)).await;
+                        return Ok(None);
                     }
                     S3ResponseClassification::TransientRetryable => {
                         if attempts >= max_attempts {
@@ -197,13 +198,10 @@ pub async fn s3_download_range(
             Err(e) => {
                 match classify_get_error(&e) {
                     S3ResponseClassification::ObjectNotFound => {
-                        if attempts >= max_attempts {
-                            if must_exist {
-                                return Err(format!("Expected object {} (range {}) does not exist in S3 (NoSuchKey confirmed)", key, range_header));
-                            }
-                            return Ok(None);
+                        if must_exist {
+                            return Err(format!("Expected object {} (range {}) does not exist in S3 (NoSuchKey confirmed)", key, range_header));
                         }
-                        tokio::time::sleep(calculate_backoff(attempts)).await;
+                        return Ok(None);
                     }
                     S3ResponseClassification::TransientRetryable => {
                         if attempts >= max_attempts {
@@ -235,10 +233,7 @@ pub async fn s3_check_exists(
             Err(e) => {
                 match classify_head_error(&e) {
                     S3ResponseClassification::ObjectNotFound => {
-                        if attempts >= max_attempts {
-                            return Ok(false);
-                        }
-                        tokio::time::sleep(calculate_backoff(attempts)).await;
+                        return Ok(false);
                     }
                     S3ResponseClassification::TransientRetryable => {
                         if attempts >= max_attempts {
@@ -472,10 +467,7 @@ pub async fn reqwest_download_footer_with_retry(
                         }
                     }
                 } else if status == reqwest::StatusCode::NOT_FOUND {
-                    if attempts >= max_attempts {
-                        return Ok(None);
-                    }
-                    tokio::time::sleep(calculate_backoff(attempts)).await;
+                    return Ok(None);
                 } else {
                     let err = format!("HTTP {}", status);
                     if attempts >= max_attempts {

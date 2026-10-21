@@ -563,7 +563,7 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS, true).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
@@ -737,18 +737,9 @@ fn _verify_pre_gc_transaction(
                 let bucket = bucket.to_string();
                 let xh = xorb_hash_hex.clone();
                 async move {
-                    let key_staged = format!("gc_consolidated/xorbs/{}", xh);
                     let key_live = format!("xorbs/default/{}", xh);
-                    
-                    let staged = s3_check_exists(&client, &bucket, &key_staged, MAX_S3_ATTEMPTS).await?;
-                    if staged {
-                        return Ok((xh, true));
-                    }
                     let live = s3_check_exists(&client, &bucket, &key_live, MAX_S3_ATTEMPTS).await?;
-                    if live {
-                        return Ok((xh, true));
-                    }
-                    Ok((xh, false))
+                    Ok((xh, live))
                 }
             });
             
@@ -888,7 +879,7 @@ fn _verify_post_gc_transaction(
     eprintln!("[GC Verify POST] Phase 1: Downloading and registering {} new shards", new_shards.len());
     for ns in &new_shards {
         let key = format!("gc_consolidated/shards/{}.mdb", ns);
-        let data = rt.block_on(async { s3_download_object(client, bucket, &key, MAX_S3_ATTEMPTS).await })
+        let data = rt.block_on(async { s3_download_object(client, bucket, &key, MAX_S3_ATTEMPTS, true).await })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Missing new shard: {}", key)))?;
         
@@ -952,6 +943,14 @@ fn _verify_post_gc_transaction(
     use futures::stream::{StreamExt, iter};
     let mut missing_xorbs_table = write_txn.open_table(redb::TableDefinition::<&str, ()>::new("txn_missing_post_xorbs")).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     
+    let mut new_xorbs = std::collections::HashSet::new();
+    if let Ok(new_xorbs_table) = write_txn.open_table(TXN_NEW_XORBS_TABLE) {
+        for item in new_xorbs_table.iter().unwrap() {
+            let (hash_key, _) = item.unwrap();
+            new_xorbs.insert(hash_key.value().to_string());
+        }
+    }
+
     let mut batch = Vec::with_capacity(100);
     let mut process_batch = |b: &mut Vec<String>| -> PyResult<()> {
         let results = rt.block_on(async {
@@ -959,14 +958,15 @@ fn _verify_post_gc_transaction(
                 let client = client.clone();
                 let bucket = bucket.to_string();
                 let xh = xorb_hash_hex.clone();
+                let is_new = new_xorbs.contains(&xh);
                 async move {
-                    let key_staged = format!("gc_consolidated/xorbs/{}", xh);
-                    let key_live = format!("xorbs/default/{}", xh);
-                    let staged = s3_check_exists(&client, &bucket, &key_staged, MAX_S3_ATTEMPTS).await?;
-                    if staged { return Ok((xh, true)); }
-                    let live = s3_check_exists(&client, &bucket, &key_live, MAX_S3_ATTEMPTS).await?;
-                    if live { return Ok((xh, true)); }
-                    Ok((xh, false))
+                    let key = if is_new {
+                        format!("gc_consolidated/xorbs/{}", xh)
+                    } else {
+                        format!("xorbs/default/{}", xh)
+                    };
+                    let exists = s3_check_exists(&client, &bucket, &key, MAX_S3_ATTEMPTS).await?;
+                    Ok((xh, exists))
                 }
             });
             iter(futures_iter)
@@ -1046,6 +1046,9 @@ fn _verify_post_gc_transaction(
         }
     }
 
+    drop(verify_sfm);
+    let _ = std::fs::remove_dir_all(&temp_dir_path);
+
     Ok(missing_count)
 }
 
@@ -1059,7 +1062,7 @@ pub fn _verify_gc_transaction(
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS, true).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
@@ -1119,7 +1122,7 @@ pub fn _commit_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS, true).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
@@ -1162,7 +1165,7 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS, true).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
@@ -1318,7 +1321,7 @@ pub fn _prune_garbage() -> PyResult<()> {
         let lock_key = "gc/active_transaction.redb";
         
         let mut should_delete = false;
-        if let Ok(Some(data)) = s3_download_object(&client, &bucket, lock_key, MAX_S3_ATTEMPTS).await {
+        if let Some(data) = s3_download_object(&client, &bucket, lock_key, MAX_S3_ATTEMPTS, false).await? {
             if let Ok(_) = std::fs::write(txn_path, &data) {
                 if let Ok(db) = Database::open(txn_path) {
                     if let Ok(read_txn) = db.begin_read() {
@@ -1341,7 +1344,7 @@ pub fn _prune_garbage() -> PyResult<()> {
         }
 
         Ok::<_, String>(())
-    }).unwrap();
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     Ok(())
 }
@@ -1353,7 +1356,7 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
     
     rt.block_on(async {
         let key = "gc/active_transaction.redb";
-        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await?
+        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS, false).await?
             .ok_or_else(|| format!("Lock file {} not found", key))?;
         std::fs::write(&txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
         Ok::<_, String>(())
