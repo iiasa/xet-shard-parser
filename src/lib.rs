@@ -1326,6 +1326,25 @@ pub fn add_footer_to_xorb(py: Python<'_>, xorb_bytes: &[u8]) -> PyResult<PyObjec
     Ok(bytes.into())
 }
 
+/// Rebuilds the xorb footer from the chunk data and returns `(xorb_bytes, xorb_hash_hex)`.
+///
+/// Any existing footer (valid or not) is discarded: chunk parsing stops at the `XETBLOB`
+/// footer identifier and a fresh footer is written. The returned hash is computed from the
+/// chunks themselves, so callers can verify it matches the xorb's name before storing.
+#[pyfunction]
+pub fn add_footer_to_xorb_with_hash(py: Python<'_>, xorb_bytes: &[u8]) -> PyResult<(PyObject, String)> {
+    let (output, hash) = py.allow_threads(|| {
+        let mut output = Vec::new();
+        match reconstruct_xorb_with_footer(&mut output, xorb_bytes) {
+            Ok((_, hash)) => Ok((output, hash.hex())),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to reconstruct xorb with footer: {:?}", e)))
+        }
+    })?;
+
+    let bytes = pyo3::types::PyBytes::new(py, &output);
+    Ok((bytes.into(), hash))
+}
+
 fn bytes_to_in_memory_shard(shard_bytes: &[u8]) -> PyResult<mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard> {
     use mdb_shard::metadata_shard::shard_in_memory::MDBInMemoryShard;
     use mdb_shard::metadata_shard::file_structs::MDBFileInfo;
@@ -1395,6 +1414,7 @@ fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_shard_hash, m)?)?;
     m.add_function(wrap_pyfunction!(merge_shards, m)?)?;
     m.add_function(wrap_pyfunction!(add_footer_to_xorb, m)?)?;
+    m.add_function(wrap_pyfunction!(add_footer_to_xorb_with_hash, m)?)?;
     m.add_function(wrap_pyfunction!(reconstruct_shard, m)?)?;
     m.add_function(wrap_pyfunction!(get_gc_transaction_info, m)?)?;
 
