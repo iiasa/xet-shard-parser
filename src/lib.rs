@@ -14,6 +14,7 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 mod blender;
 pub mod s3_client;
+mod verify;
 use futures::StreamExt;
 use reqwest::Client;
 
@@ -185,14 +186,25 @@ impl ShardIndex {
 
 
 
-    #[pyo3(signature = ())]
-    pub fn start_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
+    /// Starts a GC transaction.
+    ///
+    /// `started_at` is the unix time start began (before the liveness check). Xorbs whose S3
+    /// LastModified is less than `min_age_days` before `started_at` are never removed or
+    /// repacked by this run.
+    #[pyo3(signature = (started_at, min_age_days=28.0))]
+    pub fn start_gc_transaction(&self, py: Python<'_>, started_at: u64, min_age_days: f64) -> PyResult<bool> {
         let has_sparse = py.allow_threads(|| {
             let gc_db_lock = self.gc_db.read().unwrap();
             if gc_db_lock.is_none() {
                 return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized"));
             }
             let db = gc_db_lock.as_ref().unwrap();
+
+            let min_age_secs = (min_age_days.max(0.0) * 86400.0) as u64;
+            let cutoff = started_at.saturating_sub(min_age_secs);
+            let removed = blender::_drop_young_from_sparse(db, cutoff)?;
+            eprintln!("[GC] Skipping {removed} xorbs written in the last {min_age_days} days.");
+
             let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
             let sparse_xorbs = read_txn.open_table(blender::GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
             
@@ -203,7 +215,7 @@ impl ShardIndex {
             drop(read_txn);
             drop(gc_db_lock);
             
-            blender::_consolidate_metadata(self.sfm.clone(), self.gc_db.clone())?;
+            blender::_consolidate_metadata(self.sfm.clone(), self.gc_db.clone(), started_at)?;
             Ok(true)
         })?;
         Ok(has_sparse)
@@ -226,13 +238,12 @@ impl ShardIndex {
         Ok(missing)
     }
 
-    #[pyo3(signature = ())]
-    pub fn commit_gc_transaction(&self, py: Python<'_>) -> PyResult<bool> {
-        py.allow_threads(|| {
-            blender::_commit_gc_transaction()?;
-            Ok::<_, pyo3::PyErr>(())
-        })?;
-        Ok(true)
+    /// Commits a staged transaction. Call `init_gc` + `build_live_chunks_list` (the liveness
+    /// check) first, so the live xorb set reflects the current database.
+    /// Returns (moved, kept) old xorb hashes.
+    #[pyo3(signature = (min_wait_secs, skip_wait=false))]
+    pub fn commit_gc_transaction(&self, py: Python<'_>, min_wait_secs: u64, skip_wait: bool) -> PyResult<(Vec<String>, Vec<String>)> {
+        py.allow_threads(|| blender::_commit_gc_transaction(self.gc_db.clone(), min_wait_secs, skip_wait))
     }
 
     #[pyo3(signature = ())]
@@ -952,6 +963,33 @@ impl ShardIndex {
         })
     }
 
+    /// Verifies an uploaded shard against data the server trusts.
+    ///
+    /// `server_chunks` maps xorb hash (hex) to the packed chunk list saved at xorb upload
+    /// (see `xorb_chunk_list`). Returns `None` when the shard passes, otherwise
+    /// `(reason, hash_hex)` for the first failing check.
+    #[pyo3(signature = (shard_bytes, server_chunks))]
+    pub fn verify_shard(
+        &self,
+        py: Python<'_>,
+        shard_bytes: &[u8],
+        server_chunks: &PyDict,
+    ) -> PyResult<Option<(String, String)>> {
+        let mut chunks = std::collections::HashMap::new();
+        for (k, v) in server_chunks.iter() {
+            let hex: String = k.extract()?;
+            let bytes: &[u8] = v.extract()?;
+            if let (Ok(h), Some(list)) = (MerkleHash::from_hex(&hex), verify::unpack_chunk_list(bytes)) {
+                chunks.insert(h, list);
+            }
+        }
+        let shard_bytes = shard_bytes.to_vec();
+        let result = py.allow_threads(|| {
+            self.rt.block_on(verify::verify_shard(&self.sfm, &shard_bytes, chunks))
+        });
+        Ok(result.err())
+    }
+
     #[pyo3(signature = (sparse_threshold=30.0))]
     pub fn run_global_utilization_analysis(&self, _py: Python<'_>, sparse_threshold: f64) -> PyResult<()> {
         _py.allow_threads(|| {
@@ -1408,6 +1446,40 @@ pub fn get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     blender::_get_gc_transaction_info(py)
 }
 
+/// Returns the packed chunk list (32-byte hash + u32 LE unpacked size per chunk) read from
+/// the footer of a xorb object, as built by `add_footer_to_xorb_with_hash`.
+#[pyfunction]
+pub fn xorb_chunk_list(py: Python<'_>, xorb_bytes: &[u8]) -> PyResult<PyObject> {
+    let packed = py.allow_threads(|| {
+        verify::chunk_list_from_xorb_footer(xorb_bytes)
+            .map(|list| verify::pack_chunk_list(&list))
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Failed to read xorb footer"))
+    })?;
+    Ok(PyBytes::new(py, &packed).into())
+}
+
+/// Returns the hashes (hex) of the xorbs listed in a shard's CAS info section: the xorbs new
+/// in the upload that produced this shard.
+#[pyfunction]
+pub fn shard_xorb_hashes(py: Python<'_>, shard_bytes: &[u8]) -> PyResult<Vec<String>> {
+    py.allow_threads(|| {
+        let shard = MDBMinimalShard::from_reader(&mut Cursor::new(shard_bytes), false, true)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {e:?}")))?;
+        Ok((0..shard.num_xorb()).filter_map(|i| shard.xorb(i)).map(|x| x.xorb_hash().hex()).collect())
+    })
+}
+
+/// Returns a copy of the shard with the footer's expiry set to `expiry_unix` (seconds).
+/// Used for /v1/chunks answers; the stored shard is not changed.
+#[pyfunction]
+pub fn with_dedup_expiry(py: Python<'_>, shard_bytes: &[u8], expiry_unix: u64) -> PyResult<PyObject> {
+    let out = py.allow_threads(|| {
+        verify::with_dedup_expiry(shard_bytes, expiry_unix)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))
+    })?;
+    Ok(PyBytes::new(py, &out).into())
+}
+
 #[pymodule]
 fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ShardIndex>()?;
@@ -1417,6 +1489,9 @@ fn xet_shard_parser(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(add_footer_to_xorb_with_hash, m)?)?;
     m.add_function(wrap_pyfunction!(reconstruct_shard, m)?)?;
     m.add_function(wrap_pyfunction!(get_gc_transaction_info, m)?)?;
+    m.add_function(wrap_pyfunction!(xorb_chunk_list, m)?)?;
+    m.add_function(wrap_pyfunction!(with_dedup_expiry, m)?)?;
+    m.add_function(wrap_pyfunction!(shard_xorb_hashes, m)?)?;
 
     Ok(())
 }

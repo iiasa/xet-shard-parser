@@ -380,31 +380,36 @@ pub async fn s3_upload_file_reqwest_http1(
     file_path: &str,
     max_attempts: u32,
 ) -> Result<(), String> {
-    let presigned = client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .presigned(aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(600)).map_err(|e| format!("{:?}", e))?)
-        .await
-        .map_err(|e| format!("Presigning failed for {}: {:?}", key, e))?;
-        
     let reqwest_client = ReqwestClient::builder()
         .http1_only()
         .danger_accept_invalid_certs(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("Reqwest init failed: {:?}", e))?;
         
     let file_data = tokio::fs::read(file_path).await.map_err(|e| format!("Failed to read file {file_path}: {:?}", e))?;
     let size = file_data.len();
+    // A stalled connection must not hang forever: allow 60 s plus 1 s per MB for each attempt.
+    let attempt_timeout = std::time::Duration::from_secs(60 + (size as u64) / (1024 * 1024));
     
     let mut attempts = 0;
     loop {
         attempts += 1;
+        // Presign per attempt, so retries keep working after an earlier URL expired.
+        let presigned = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(600)).map_err(|e| format!("{:?}", e))?)
+            .await
+            .map_err(|e| format!("Presigning failed for {}: {:?}", key, e))?;
+
         eprintln!("[GC Upload] Uploading {} ({:.2} MB, attempt {}/{})...", key, size as f64 / (1024.0 * 1024.0), attempts, max_attempts);
         let body = reqwest::Body::from(file_data.clone());
         
         let request = reqwest_client.put(presigned.uri().to_string())
             .header("Content-Length", size.to_string())
+            .timeout(attempt_timeout)
             .body(body);
             
         match request.send().await {

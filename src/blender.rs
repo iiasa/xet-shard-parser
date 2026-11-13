@@ -54,6 +54,154 @@ fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Ve
     Some((info.chunk_hashes, info.chunk_boundary_offsets, info.unpacked_chunk_offsets))
 }
 
+pub const TXN_KEPT_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_kept_xorbs");
+
+/// Seconds a committed transaction's bin/ contents are kept, so a commit can still be reverted.
+const BIN_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+fn io_err(e: impl std::fmt::Display) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
+}
+
+fn value_err(e: impl std::fmt::Display) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
+}
+
+/// Lists `xorbs/default/` page by page and returns the xorbs whose LastModified is at or after `cutoff_unix`.
+pub fn _list_young_xorbs(cutoff_unix: u64) -> PyResult<HashSet<[u8; 32]>> {
+    let rt = Runtime::new().unwrap();
+    let (client, bucket) = create_s3_client()?;
+    rt.block_on(async {
+        let mut young = HashSet::new();
+        let mut token: Option<String> = None;
+        loop {
+            let resp = s3_list_objects_v2(&client, &bucket, "xorbs/default/", token.as_deref(), MAX_S3_ATTEMPTS).await?;
+            for obj in resp.contents() {
+                let (Some(key), Some(modified)) = (obj.key(), obj.last_modified()) else { continue };
+                if modified.secs() < 0 || (modified.secs() as u64) < cutoff_unix {
+                    continue;
+                }
+                if let Ok(h) = MerkleHash::from_hex(key.rsplit('/').next().unwrap_or("")) {
+                    young.insert(h.into());
+                }
+            }
+            token = resp.next_continuation_token().map(String::from);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok::<_, String>(young)
+    }).map_err(io_err)
+}
+
+/// Removes xorbs last written at or after `cutoff_unix` from the GC's sparse set, so start
+/// never removes or repacks them. Returns how many were removed.
+pub fn _drop_young_from_sparse(gc_db: &Database, cutoff_unix: u64) -> PyResult<usize> {
+    let young = _list_young_xorbs(cutoff_unix)?;
+    let write_txn = gc_db.begin_write().map_err(io_err)?;
+    let mut removed = 0;
+    {
+        let mut sparse = write_txn.open_table(GC_SPARSE_XORBS_TABLE).map_err(io_err)?;
+        for h in &young {
+            if sparse.remove(h).map_err(io_err)?.is_some() {
+                removed += 1;
+            }
+        }
+    }
+    write_txn.commit().map_err(io_err)?;
+    Ok(removed)
+}
+
+/// Downloads the transaction lock file to `txn_path`.
+fn download_lock(rt: &Runtime, client: &aws_sdk_s3::Client, bucket: &str, txn_path: &str) -> PyResult<()> {
+    rt.block_on(async {
+        let key = "gc/active_transaction.redb";
+        let data = s3_download_object(client, bucket, key, MAX_S3_ATTEMPTS, true).await?
+            .ok_or_else(|| format!("Lock file {} not found", key))?;
+        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
+        Ok::<_, String>(())
+    }).map_err(io_err)
+}
+
+fn upload_lock(rt: &Runtime, client: &aws_sdk_s3::Client, bucket: &str, txn_path: &str) -> PyResult<()> {
+    rt.block_on(async {
+        s3_upload_file_reqwest_http1(client, bucket, "gc/active_transaction.redb", txn_path, MAX_S3_ATTEMPTS).await
+            .map_err(|e| format!("Failed to upload lock: {e}"))
+    }).map_err(io_err)?;
+    let _ = std::fs::remove_file(txn_path);
+    Ok(())
+}
+
+/// Returns the LastModified time (unix seconds) of an object, or None if it doesn't exist.
+async fn s3_last_modified(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> Result<Option<u64>, String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match client.head_object().bucket(bucket).key(key).send().await {
+            Ok(resp) => return Ok(resp.last_modified().map(|t| t.secs().max(0) as u64)),
+            Err(e) => {
+                if let Some(service_err) = e.as_service_error() {
+                    if service_err.is_not_found() {
+                        return Ok(None);
+                    }
+                }
+                if attempts >= MAX_S3_ATTEMPTS {
+                    return Err(format!("HEAD {key} failed after {attempts} attempts: {e:?}"));
+                }
+                tokio::time::sleep(crate::s3_client::calculate_backoff(attempts)).await;
+            }
+        }
+    }
+}
+
+/// Attempts per move before the step stops with an error (each copy also retries internally).
+const MOVE_ATTEMPTS: u32 = 3;
+
+#[derive(Debug, PartialEq)]
+enum MoveOutcome {
+    Moved,
+    /// The source is gone and the destination exists: an earlier, interrupted run moved it.
+    AlreadyMoved,
+    /// Neither exists, even after re-checking.
+    NothingToMove,
+}
+
+/// Moves an object within the bucket: copy, confirm the copy exists, then delete the source.
+///
+/// The source is only deleted after a HEAD confirms the destination, so a copy that failed or
+/// was wrongly reported as "source not found" can never lose data. Retries a few times, then
+/// returns an error with the source kept, so the step stops and can be run again.
+async fn s3_move_object(client: &aws_sdk_s3::Client, bucket: &str, src_key: &str, dest_key: &str) -> Result<MoveOutcome, String> {
+    for attempt in 1..=MOVE_ATTEMPTS {
+        if s3_last_modified(client, bucket, src_key).await?.is_none() {
+            if s3_last_modified(client, bucket, dest_key).await?.is_some() {
+                return Ok(MoveOutcome::AlreadyMoved);
+            }
+            if attempt < MOVE_ATTEMPTS {
+                // Re-check in case the "not found" was misreported.
+                tokio::time::sleep(crate::s3_client::calculate_backoff(attempt)).await;
+                continue;
+            }
+            return Ok(MoveOutcome::NothingToMove);
+        }
+
+        let copy_source = format!("{bucket}/{src_key}");
+        let copied = s3_copy_object(client, bucket, &copy_source, dest_key, MAX_S3_ATTEMPTS, false).await;
+        if copied.is_ok() && s3_last_modified(client, bucket, dest_key).await?.is_some() {
+            s3_delete_object(client, bucket, src_key, MAX_S3_ATTEMPTS).await
+                .map_err(|e| format!("Copied {src_key} to {dest_key} but could not delete the source: {e}"))?;
+            return Ok(MoveOutcome::Moved);
+        }
+        eprintln!("[GC Move] {src_key} -> {dest_key} not confirmed (attempt {attempt}/{MOVE_ATTEMPTS}): {copied:?}");
+        tokio::time::sleep(crate::s3_client::calculate_backoff(attempt)).await;
+    }
+    Err(format!("Could not move {src_key} to {dest_key} after {MOVE_ATTEMPTS} attempts; the source was kept. Run the step again."))
+}
+
 fn get_current_rss_mb() -> f64 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
@@ -75,6 +223,7 @@ use mdb_shard::metadata_shard::ShardFileManager;
 pub fn _consolidate_metadata(
     sfm: Arc<ShardFileManager>,
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
+    started_at: u64,
 ) -> PyResult<()> {
     
     let gc_db_lock = gc_db.read().unwrap();
@@ -112,6 +261,8 @@ pub fn _consolidate_metadata(
     let mut meta_table = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
     meta_table.insert("status", "consolidated").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert error: {e}")))?;
     meta_table.insert("timestamp", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string().as_str()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert error: {e}")))?;
+    // When start began (before the liveness snapshot). Commit keeps any old xorb written after this.
+    meta_table.insert("started_at", started_at.to_string().as_str()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Insert error: {e}")))?;
     
     let mut old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
     let mut new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
@@ -586,8 +737,7 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
         let new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let new_shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        
+
         rt.block_on(async {
             // Copy XORBs
             for item in new_xorbs_table.iter().unwrap() {
@@ -618,35 +768,21 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
                 let hash_str = hash_key.value();
                 
                 // Move old shard to bin
-                let src = format!("{}/shards/{}.mdb", bucket, hash_str);
-                let dest = format!("bin/shards/{}.mdb", hash_str);
-                s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, true).await
-                    .map_err(|e| format!("Copy failed for {}: {:?}", hash_str, e))?;
-                let key_to_del = format!("shards/{}.mdb", hash_str);
-                let _ = s3_delete_object(&client, &bucket, &key_to_del, MAX_S3_ATTEMPTS).await;
+                s3_move_object(&client, &bucket, &format!("shards/{hash_str}.mdb"), &format!("bin/shards/{hash_str}.mdb")).await?;
 
                 // Create tombstone
                 let key = format!("shards/tombstones/{}.revoked", hash_str);
                 s3_put_object(&client, &bucket, &key, Vec::new(), MAX_S3_ATTEMPTS).await
                     .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
             }
-            
-            // Move old XORBs
-            for item in old_xorbs_table.iter().unwrap() {
-                let (hash_key, _) = item.unwrap();
-                let hash_str = hash_key.value();
-                
-                let src = format!("{}/xorbs/default/{}", bucket, hash_str);
-                let dest = format!("bin/xorbs/{}", hash_str);
-                s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, true).await
-                    .map_err(|e| format!("Copy failed for {}: {:?}", hash_str, e))?;
-                let key_to_del = format!("xorbs/default/{}", hash_str);
-                let _ = s3_delete_object(&client, &bucket, &key_to_del, MAX_S3_ATTEMPTS).await;
-            }
+
+            // Old XORBs stay in xorbs/default/ until commit: clients may still hold dedup
+            // answers that point at them, and commit re-checks whether they came back into use.
             Ok::<_, String>(())
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-        
+
         meta.insert("status", "staged").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        meta.insert("staged_at", unix_now().to_string().as_str()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     }
     
     write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit err: {e}")))?;
@@ -1115,176 +1251,250 @@ pub fn _verify_gc_transaction(
     Ok(missing_post_gc)
 }
 
-pub fn _commit_gc_transaction() -> PyResult<()> {
+/// Commits a staged transaction: moves the old xorbs that are still unused to bin/xorbs/.
+///
+/// Refuses until `min_wait_secs` after stage unless `skip_wait`. Uses the live xorb set in
+/// `gc_db`, which the caller must have just rebuilt from the current database. An old xorb is
+/// kept if a live file uses it, or if it was written again after start (a client re-uploaded it).
+/// Returns (moved, kept) xorb hashes.
+pub fn _commit_gc_transaction(
+    gc_db: Arc<std::sync::RwLock<Option<Database>>>,
+    min_wait_secs: u64,
+    skip_wait: bool,
+) -> PyResult<(Vec<String>, Vec<String>)> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = create_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
-    
-    rt.block_on(async {
-        let key = "gc/active_transaction.redb";
-        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS, true).await?
-            .ok_or_else(|| format!("Lock file {} not found", key))?;
-        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
-        Ok::<_, String>(())
-    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-    
-    let db = Database::open(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
-    let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
-    
+    download_lock(&rt, &client, &bucket, txn_path)?;
+
+    let db = Database::open(txn_path).map_err(|e| io_err(format!("DB err: {e}")))?;
+    let write_txn = db.begin_write().map_err(io_err)?;
+    let moved: Vec<String>;
+    let mut kept = Vec::new();
     {
-        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let status = meta.get("status").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let status_val = status.map(|s| s.value().to_string()).unwrap_or_default();
-        if status_val != "staged" && status_val != "verified" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot commit: status is not staged or verified"));
+        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(io_err)?;
+        let get = |meta: &redb::Table<&str, &str>, k: &str| -> Option<String> {
+            meta.get(k).ok().flatten().map(|v| v.value().to_string())
+        };
+        let status_val = get(&meta, "status").unwrap_or_default();
+        if status_val != "staged" {
+            return Err(value_err(format!("Cannot commit: status is '{status_val}', must be 'staged'. Run stage first.")));
         }
-        
-        // Tombstones for old_shards are already created during stage_gc, no need to create them here
-        
-        meta.insert("status", "committed").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        let staged_at: u64 = get(&meta, "staged_at").and_then(|v| v.parse().ok())
+            .ok_or_else(|| value_err("Cannot commit: transaction has no staged_at (staged by an older version). Revert it and run GC again."))?;
+        let started_at: u64 = get(&meta, "started_at").and_then(|v| v.parse().ok())
+            .or_else(|| get(&meta, "timestamp").and_then(|v| v.parse().ok()))
+            .unwrap_or(staged_at);
+
+        let now = unix_now();
+        let ready_at = staged_at + min_wait_secs;
+        if !skip_wait && now < ready_at {
+            let hours = (ready_at - now + 3599) / 3600;
+            return Err(value_err(format!(
+                "Cannot commit yet: wait until {ready_at} (unix), about {hours} more hours, so dedup answers that offered the old xorbs have expired."
+            )));
+        }
+
+        let gc_db_lock = gc_db.read().unwrap();
+        let gcdb = gc_db_lock.as_ref().ok_or_else(|| value_err("GC DB not initialized: run the liveness check before commit"))?;
+        let gc_read = gcdb.begin_read().map_err(io_err)?;
+        let live_xorbs = gc_read.open_table(GC_LIVE_XORBS_TABLE).map_err(io_err)?;
+
+        let old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(io_err)?;
+        let mut candidates = Vec::new();
+        for item in old_xorbs_table.iter().map_err(io_err)? {
+            let (k, _) = item.map_err(io_err)?;
+            let hash_str = k.value().to_string();
+            let Ok(h) = MerkleHash::from_hex(&hash_str) else { continue };
+            let h_bytes: [u8; 32] = h.into();
+            if live_xorbs.get(&h_bytes).map_err(io_err)?.is_some() {
+                eprintln!("[GC Commit] Keeping {hash_str}: used by a live file.");
+                kept.push(hash_str);
+            } else {
+                candidates.push(hash_str);
+            }
+        }
+        drop(old_xorbs_table);
+
+        let results: Vec<(String, Result<Option<u64>, String>)> = rt.block_on(async {
+            use futures::stream::{iter, StreamExt};
+            iter(candidates.into_iter().map(|hash_str| {
+                let client = client.clone();
+                let bucket = bucket.clone();
+                async move {
+                    let res = s3_last_modified(&client, &bucket, &format!("xorbs/default/{hash_str}")).await;
+                    (hash_str, res)
+                }
+            }))
+            .buffer_unordered(MAX_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+        });
+
+        let mut to_move = Vec::new();
+        for (hash_str, res) in results {
+            match res.map_err(io_err)? {
+                None => {}, // already gone (e.g. moved by an earlier, interrupted commit)
+                Some(modified) if modified >= started_at => {
+                    eprintln!("[GC Commit] Keeping {hash_str}: written again after start.");
+                    kept.push(hash_str);
+                },
+                Some(_) => to_move.push(hash_str),
+            }
+        }
+
+        rt.block_on(async {
+            for hash_str in &to_move {
+                s3_move_object(&client, &bucket, &format!("xorbs/default/{hash_str}"), &format!("bin/xorbs/{hash_str}")).await?;
+            }
+            Ok::<_, String>(())
+        }).map_err(io_err)?;
+        moved = to_move;
+
+        let mut kept_table = write_txn.open_table(TXN_KEPT_XORBS_TABLE).map_err(io_err)?;
+        for h in &kept {
+            kept_table.insert(h.as_str(), ()).map_err(io_err)?;
+        }
+        meta.insert("status", "committed").map_err(io_err)?;
+        meta.insert("committed_at", now.to_string().as_str()).map_err(io_err)?;
     }
-    
-    write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit err: {e}")))?;
+
+    write_txn.commit().map_err(io_err)?;
     drop(db);
-    
-    rt.block_on(async {
-        let key = "gc/active_transaction.redb";
-        s3_upload_file_reqwest_http1(&client, &bucket, key, txn_path, MAX_S3_ATTEMPTS).await
-            .map_err(|e| format!("Failed to upload committed lock: {e}"))?;
-        Ok::<_, String>(())
-    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-    
-    let _ = std::fs::remove_file(txn_path);
-    Ok(())
+    upload_lock(&rt, &client, &bucket, txn_path)?;
+    Ok((moved, kept))
 }
 
+/// Reverts a staged or committed transaction by adding the old shards (and, after commit, the
+/// moved old xorbs) back. Never deletes: new shards and xorbs stay, because uploads since
+/// stage may dedup against them. Old and new are both valid; the next GC removes the duplicate.
 pub fn _revert_gc_transaction() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = create_s3_client()?;
     let txn_path = "/tmp/active_transaction.redb";
-    
-    rt.block_on(async {
-        let key = "gc/active_transaction.redb";
-        let data = s3_download_object(&client, &bucket, key, MAX_S3_ATTEMPTS, true).await?
-            .ok_or_else(|| format!("Lock file {} not found", key))?;
-        std::fs::write(txn_path, data).map_err(|e| format!("Failed to save lock: {}", e))?;
-        Ok::<_, String>(())
-    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-    
-    let db = Database::open(txn_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("DB err: {e}")))?;
-    let write_txn = db.begin_write().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn err: {e}")))?;
-    
+    download_lock(&rt, &client, &bucket, txn_path)?;
+
+    let db = Database::open(txn_path).map_err(|e| io_err(format!("DB err: {e}")))?;
+    let write_txn = db.begin_write().map_err(io_err)?;
     {
-        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let status = meta.get("status").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let status_val = status.map(|s| s.value().to_string()).unwrap_or_default();
-        if status_val == "consolidated" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot revert: transaction has not been staged yet. Nothing to revert."));
-        } else if status_val != "staged" && status_val != "verified" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot revert: status is not staged or verified"));
+        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(io_err)?;
+        let status_val = meta.get("status").map_err(io_err)?.map(|s| s.value().to_string()).unwrap_or_default();
+        match status_val.as_str() {
+            "staged" | "committed" => {},
+            "consolidated" | "verified" | "verification_failed" | "failed" => {
+                return Err(value_err("Cannot revert: transaction has not been staged yet. Nothing to revert."));
+            },
+            other => return Err(value_err(format!("Cannot revert: status is '{other}', must be 'staged' or 'committed'"))),
         }
-        
-        let new_shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        let old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-        
+
+        let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(io_err)?;
+        let old_xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(io_err)?;
+
         rt.block_on(async {
-            for item in new_shards_table.iter().unwrap() {
-                let (hash_key, _) = item.unwrap();
-                let hash_str = hash_key.value();
-                
-                let active_key = format!("shards/{}.mdb", hash_str);
-                let _ = s3_delete_object(&client, &bucket, &active_key, MAX_S3_ATTEMPTS).await;
-                
-                let key = format!("shards/tombstones/{}.revoked", hash_str);
-                s3_put_object(&client, &bucket, &key, Vec::new(), MAX_S3_ATTEMPTS).await
-                    .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
-            }
-            
-            for item in new_xorbs_table.iter().unwrap() {
-                let (hash_key, _) = item.unwrap();
-                let hash_str = hash_key.value();
-                let active_key = format!("xorbs/default/{}", hash_str);
-                let _ = s3_delete_object(&client, &bucket, &active_key, MAX_S3_ATTEMPTS).await;
-            }
-            
-            // Delete tombstones for old shards (resurrection) and move back from bin
+            // Old shards back from bin, and their tombstones removed (resurrection).
             for item in old_shards_table.iter().unwrap() {
                 let (hash_key, _) = item.unwrap();
                 let hash_str = hash_key.value();
-                
-                let key = format!("shards/tombstones/{}.revoked", hash_str);
-                let _ = s3_delete_object(&client, &bucket, &key, MAX_S3_ATTEMPTS).await;
-                
-                let src = format!("{}/bin/shards/{}.mdb", bucket, hash_str);
-                let dest = format!("shards/{}.mdb", hash_str);
-                if let Ok(_) = s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, true).await {
-                    let bin_key = format!("bin/shards/{}.mdb", hash_str);
-                    let _ = s3_delete_object(&client, &bucket, &bin_key, MAX_S3_ATTEMPTS).await;
+
+                // Any failure stops the revert before it is marked "reverted", so prune keeps bin/.
+                let outcome = s3_move_object(&client, &bucket, &format!("bin/shards/{hash_str}.mdb"), &format!("shards/{hash_str}.mdb")).await?;
+                if outcome == MoveOutcome::NothingToMove {
+                    eprintln!("[GC Revert] Old shard {hash_str} is in neither bin/shards/ nor shards/.");
                 }
+                let key = format!("shards/tombstones/{}.revoked", hash_str);
+                s3_delete_object(&client, &bucket, &key, MAX_S3_ATTEMPTS).await?;
             }
 
+            // Old xorbs that commit moved go back too. Done whatever the status says: a commit
+            // interrupted before it saved "committed" may already have moved some of them.
+            // Xorbs that were never moved are still in xorbs/default/ (AlreadyMoved: nothing to do).
             for item in old_xorbs_table.iter().unwrap() {
                 let (hash_key, _) = item.unwrap();
                 let hash_str = hash_key.value();
-                
-                let src = format!("{}/bin/xorbs/{}", bucket, hash_str);
-                let dest = format!("xorbs/default/{}", hash_str);
-                if let Ok(_) = s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, true).await {
-                    let bin_key = format!("bin/xorbs/{}", hash_str);
-                    let _ = s3_delete_object(&client, &bucket, &bin_key, MAX_S3_ATTEMPTS).await;
+                let outcome = s3_move_object(&client, &bucket, &format!("bin/xorbs/{hash_str}"), &format!("xorbs/default/{hash_str}")).await?;
+                if outcome == MoveOutcome::NothingToMove {
+                    eprintln!("[GC Revert] Old xorb {hash_str} is in neither bin/xorbs/ nor xorbs/default/.");
                 }
             }
             Ok::<_, String>(())
-        }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-        
-        meta.insert("status", "reverted").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+        }).map_err(io_err)?;
+
+        meta.insert("status", "reverted").map_err(io_err)?;
+        meta.insert("reverted_at", unix_now().to_string().as_str()).map_err(io_err)?;
     }
-    
-    write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit err: {e}")))?;
+
+    write_txn.commit().map_err(io_err)?;
     drop(db);
-    
-    rt.block_on(async {
-        let key = "gc/active_transaction.redb";
-        s3_upload_file_reqwest_http1(&client, &bucket, key, txn_path, MAX_S3_ATTEMPTS).await
-            .map_err(|e| format!("Failed to upload reverted lock: {e}"))?;
-        Ok::<_, String>(())
-    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-    
-    let _ = std::fs::remove_file(txn_path);
-    Ok(())
+    upload_lock(&rt, &client, &bucket, txn_path)
 }
 
+/// Reads the lock file's status and committed_at, if a lock exists.
+async fn read_lock_state(client: &aws_sdk_s3::Client, bucket: &str, txn_path: &str) -> Result<Option<(String, Option<u64>)>, String> {
+    let Some(data) = s3_download_object(client, bucket, "gc/active_transaction.redb", MAX_S3_ATTEMPTS, false).await? else {
+        return Ok(None);
+    };
+    std::fs::write(txn_path, &data).map_err(|e| format!("Failed to save lock: {e}"))?;
+    let db = Database::open(txn_path).map_err(|e| format!("DB err: {e}"))?;
+    let read_txn = db.begin_read().map_err(|e| format!("Read txn err: {e}"))?;
+    let meta = read_txn.open_table(TXN_META_TABLE).map_err(|e| format!("Table err: {e}"))?;
+    let status = meta.get("status").map_err(|e| format!("{e}"))?.map(|v| v.value().to_string()).unwrap_or_default();
+    let committed_at = meta.get("committed_at").map_err(|e| format!("{e}"))?.and_then(|v| v.value().parse().ok());
+    Ok(Some((status, committed_at)))
+}
+
+/// Deletes GC leftovers.
+///
+/// bin/ and gc_consolidated/ are only emptied when no transaction needs them: none exists, it
+/// was reverted or failed, or it was committed at least 7 days ago (until then a committed GC
+/// can still be reverted). A transaction that is started or staged keeps everything.
 pub fn _prune_garbage() -> PyResult<()> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = create_s3_client()?;
     
     rt.block_on(async {
-        // Delete everything in bin/ and gc_consolidated/ immediately
-        for prefix in &["bin/", "gc_consolidated/"] {
-            let mut continuation_token: Option<String> = None;
-            loop {
-                let resp = match s3_list_objects_v2(&client, &bucket, prefix, continuation_token.as_deref(), MAX_S3_ATTEMPTS).await {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                
-                for obj in resp.contents() {
-                    if let Some(key) = obj.key() {
-                        let _ = s3_delete_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await;
+        let txn_path = "/tmp/active_transaction.redb";
+        let lock_key = "gc/active_transaction.redb";
+        let now = unix_now();
+
+        let state = read_lock_state(&client, &bucket, txn_path).await?;
+        let (bin_free, delete_lock) = match &state {
+            None => (true, false),
+            Some((status, committed_at)) => match status.as_str() {
+                "committed" => {
+                    let old_enough = committed_at.map(|t| now >= t + BIN_RETENTION_SECS).unwrap_or(false);
+                    (old_enough, old_enough)
+                },
+                "reverted" | "failed" | "skipped" => (true, true),
+                _ => (false, false), // consolidated, verified, verification_failed, staged
+            },
+        };
+        if !bin_free {
+            eprintln!("[GC Prune] Keeping bin/ and gc_consolidated/: transaction state {:?} still needs them.", state);
+        }
+
+        if bin_free {
+            for prefix in &["bin/", "gc_consolidated/"] {
+                let mut continuation_token: Option<String> = None;
+                loop {
+                    let resp = match s3_list_objects_v2(&client, &bucket, prefix, continuation_token.as_deref(), MAX_S3_ATTEMPTS).await {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    for obj in resp.contents() {
+                        if let Some(key) = obj.key() {
+                            let _ = s3_delete_object(&client, &bucket, key, MAX_S3_ATTEMPTS).await;
+                        }
                     }
-                }
-                
-                continuation_token = resp.next_continuation_token().map(String::from);
-                if continuation_token.is_none() {
-                    break;
+                    continuation_token = resp.next_continuation_token().map(String::from);
+                    if continuation_token.is_none() {
+                        break;
+                    }
                 }
             }
         }
         
         // Delete tombstones older than 7 days
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = now as i64;
         let seven_days = 7 * 24 * 60 * 60;
         
         let mut continuation_token: Option<String> = None;
@@ -1316,32 +1526,10 @@ pub fn _prune_garbage() -> PyResult<()> {
             }
         }
         
-        // Delete lock file on s3 and local path if it is not staged
-        let txn_path = "/tmp/active_transaction.redb";
-        let lock_key = "gc/active_transaction.redb";
-        
-        let mut should_delete = false;
-        if let Some(data) = s3_download_object(&client, &bucket, lock_key, MAX_S3_ATTEMPTS, false).await? {
-            if let Ok(_) = std::fs::write(txn_path, &data) {
-                if let Ok(db) = Database::open(txn_path) {
-                    if let Ok(read_txn) = db.begin_read() {
-                        if let Ok(meta_table) = read_txn.open_table(TXN_META_TABLE) {
-                            if let Ok(Some(status)) = meta_table.get("status") {
-                                let status_val = status.value().to_string();
-                                if status_val != "staged" {
-                                    should_delete = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        if should_delete {
+        if delete_lock {
             let _ = s3_delete_object(&client, &bucket, lock_key, MAX_S3_ATTEMPTS).await;
-            let _ = std::fs::remove_file(txn_path);
         }
+        let _ = std::fs::remove_file(txn_path);
 
         Ok::<_, String>(())
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
@@ -1373,6 +1561,11 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
         }
         if let Ok(Some(timestamp)) = meta_table.get("timestamp") {
             dict.set_item("timestamp", timestamp.value())?;
+        }
+        for key in ["started_at", "staged_at", "committed_at", "reverted_at"] {
+            if let Ok(Some(v)) = meta_table.get(key) {
+                dict.set_item(key, v.value())?;
+            }
         }
     }
     
