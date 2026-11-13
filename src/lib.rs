@@ -200,10 +200,17 @@ impl ShardIndex {
             }
             let db = gc_db_lock.as_ref().unwrap();
 
-            let min_age_secs = (min_age_days.max(0.0) * 86400.0) as u64;
-            let cutoff = started_at.saturating_sub(min_age_secs);
-            let removed = blender::_drop_young_from_sparse(db, cutoff)?;
-            eprintln!("[GC] Skipping {removed} xorbs written in the last {min_age_days} days.");
+            // 0 (or less) turns the age filter off, e.g. for the one-time cleanup. Comparing
+            // second-precision timestamps at the boundary would otherwise skip xorbs written in
+            // the same second as start.
+            if min_age_days > 0.0 {
+                let min_age_secs = (min_age_days * 86400.0) as u64;
+                let cutoff = started_at.saturating_sub(min_age_secs);
+                let removed = blender::_drop_young_from_sparse(db, cutoff)?;
+                eprintln!("[GC] Skipping {removed} xorbs written in the last {min_age_days} days.");
+            } else {
+                eprintln!("[GC] Age filter off (min_age_days = {min_age_days}).");
+            }
 
             let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
             let sparse_xorbs = read_txn.open_table(blender::GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;

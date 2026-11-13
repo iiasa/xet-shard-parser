@@ -371,7 +371,10 @@ pub fn _consolidate_metadata(
                     let xorb_hash = MerkleHash::from(hash_bytes);
                     let xorb_hash_str = xorb_hash.hex();
                     let key = format!("xorbs/default/{}", xorb_hash_str);
-                    let footer_bytes_result = s3_download_range(&client, &bucket, &key, "bytes=-1048576", MAX_S3_ATTEMPTS, true).await;
+                    // A missing xorb is not an error here: nothing is repacked from it, the files
+                    // using it are left out of the new shards, and verification then reports them
+                    // (status verification_failed). Network errors still stop the run.
+                    let footer_bytes_result = s3_download_range(&client, &bucket, &key, "bytes=-1048576", MAX_S3_ATTEMPTS, false).await;
                     (hash_bytes, footer_bytes_result)
                 }
             });
@@ -396,6 +399,9 @@ pub fn _consolidate_metadata(
             let xorb_hash_str = xorb_hash.hex();
             old_xorbs_table.insert(xorb_hash_str.as_str(), ()).unwrap();
             
+            if footer_bytes_opt.is_none() {
+                eprintln!("[GC] XORB {xorb_hash_str} is missing from S3; files using it will be reported by verification.");
+            }
             if let Some(footer_bytes) = footer_bytes_opt {
                 if let Some((hashes, boundaries, unpacked)) = parse_xorb_footer_data(&footer_bytes) {
                     let mut current_range: Option<RangeReq> = None;
