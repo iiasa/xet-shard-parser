@@ -552,6 +552,18 @@ pub fn _consolidate_metadata(
                         if sparse_xorbs.get(&seg_hash_bytes).unwrap().is_some() {
                             has_sparse = true;
                         }
+                        // A file entry pointing at a xorb no shard lists and S3 doesn't have.
+                        // Comes from uploads made with a stale or broken client cache before
+                        // shard verification existed (verification now rejects them). Rewrite the
+                        // shard: the entry is dropped unless a live file still uses that xorb.
+                        // GC_XORB_CHUNKS_TABLE already reflects S3 (see init_gc), so this is a
+                        // local table lookup per entry, no extra S3 request.
+                        if xorb_chunks.get(&seg_hash_bytes).unwrap().is_none() {
+                            if !has_sparse {
+                                eprintln!("[GC] Shard {shard_hash_str} references missing XORB {}; rewriting it.", seg.xorb_hash.hex());
+                            }
+                            has_sparse = true;
+                        }
                     }
                 }
             }

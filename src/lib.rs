@@ -215,7 +215,7 @@ impl ShardIndex {
             let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
             let sparse_xorbs = read_txn.open_table(blender::GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
             
-            if sparse_xorbs.is_empty().unwrap_or(true) {
+            if sparse_xorbs.is_empty().unwrap_or(true) && !self.any_file_entry_references_missing_xorb(db)? {
                 return Ok(false);
             }
             
@@ -1151,6 +1151,44 @@ impl ShardIndex {
 }
 
 impl ShardIndex {
+    /// True if any registered shard has a file entry pointing at a xorb GC can't find (no
+    /// shard lists it and S3 has no footer for it). GC start rewrites such shards, so it must
+    /// run even when no xorb is up for removal.
+    ///
+    /// How such entries arise: an upload made with a stale or broken client cache referenced a
+    /// xorb the server had no listing for, and was stored before shard verification existed.
+    /// Verification now rejects these uploads (400), so new ones can't appear; this exists to
+    /// clean up old ones during the one-time cleanup and any that remain afterwards.
+    ///
+    /// No S3 requests here: `init_gc` already filled GC_XORB_CHUNKS_TABLE from shard xorb lists
+    /// and, for xorbs only file entries reference, from S3 footers (network errors abort it).
+    /// So "not in the table" means "listed nowhere and not in S3".
+    ///
+    /// Cost: only called when nothing is up for removal (the caller's `&&` skips it otherwise);
+    /// reads file entries of the local shard files, no network; stops at the first hit.
+    fn any_file_entry_references_missing_xorb(&self, gc_db: &redb::Database) -> PyResult<bool> {
+        let read_txn = gc_db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
+        let xorb_chunks = read_txn.open_table(GC_XORB_CHUNKS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
+        let shards = self.rt.block_on(self.sfm.registered_shard_list())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
+        for shard_file in shards {
+            let Ok(mut reader) = shard_file.get_reader() else { continue };
+            let Ok(shard) = MDBMinimalShard::from_reader(&mut reader, true, false) else { continue };
+            for i in 0..shard.num_files() {
+                let Some(view) = shard.file(i) else { continue };
+                let info = mdb_shard::metadata_shard::file_structs::MDBFileInfo::from(view);
+                for seg in &info.segments {
+                    let h: [u8; 32] = seg.xorb_hash.into();
+                    if xorb_chunks.get(&h).unwrap_or(None).is_none() {
+                        eprintln!("[GC] Shard {} references missing XORB {}.", shard_file.shard_hash.hex(), seg.xorb_hash.hex());
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub fn calculate_reconstruction_internal_sync(
         py: Python<'_>,
         start_byte: Option<u64>,
