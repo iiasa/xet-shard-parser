@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use mdb_shard::metadata_shard::streaming_shard::MDBMinimalShard;
 use mdb_shard::metadata_shard::MDBShardFileHeader;
-use mdb_shard::metadata_shard::ShardFileManager;
+use mdb_shard::metadata_shard::{ChunkIndexSizeEnforcement, ShardFileManager};
 
 use mdb_shard::metadata_shard::shard_file_reconstructor::FileReconstructor;
 use mdb_shard::merklehash::{MerkleHash, compute_data_hash};
@@ -311,7 +311,7 @@ impl ShardIndex {
         py.allow_threads(|| {
             // 1. Register with ShardFileManager (persists .sib to disk and indexes in memory)
             self.rt.block_on(async {
-                self.sfm.import_shard_from_bytes(shard_bytes).await
+                self.sfm.import_shard_from_bytes(shard_bytes, ChunkIndexSizeEnforcement::StopAtCap).await
             }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to import shard: {e:?}")))?;
             Ok::<(), PyErr>(())
         })?;
@@ -567,7 +567,7 @@ impl ShardIndex {
         let prune_size = max_cache_size.unwrap_or(0);
         py.allow_threads(|| {
             self.rt.block_on(async {
-                self.sfm.refresh_shard_dir(false, prune_size).await
+                self.sfm.refresh_shard_dir(false, prune_size, ChunkIndexSizeEnforcement::StopAtCap).await
             })
         }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Refresh failed: {e:?}")))?;
         Ok(())

@@ -218,7 +218,7 @@ fn get_current_rss_mb() -> f64 {
     0.0
 }
 
-use mdb_shard::metadata_shard::ShardFileManager;
+use mdb_shard::metadata_shard::{ChunkIndexSizeEnforcement, ShardFileManager};
 
 pub fn _consolidate_metadata(
     sfm: Arc<ShardFileManager>,
@@ -1027,7 +1027,7 @@ fn _verify_post_gc_transaction(
 
     eprintln!("[GC Verify POST] Phase 1: Registering {} existing shards to temp SFM", paths_to_register.len());
     rt.block_on(async {
-        verify_sfm.register_shards_by_path(&paths_to_register).await
+        verify_sfm.register_shards_by_path(&paths_to_register, ChunkIndexSizeEnforcement::StopAtCap).await
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Register err: {e:?}")))?;
 
     eprintln!("[GC Verify POST] Phase 1: Downloading and registering {} new shards", new_shards.len());
@@ -1039,7 +1039,7 @@ fn _verify_post_gc_transaction(
         
         let path = temp_dir_path.join(format!("{}.mdb", ns));
         std::fs::write(&path, &data).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write err: {e}")))?;
-        rt.block_on(async { verify_sfm.register_shards_by_path(&[path]).await })
+        rt.block_on(async { verify_sfm.register_shards_by_path(&[path], ChunkIndexSizeEnforcement::StopAtCap).await })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Register new err: {e:?}")))?;
     }
 
