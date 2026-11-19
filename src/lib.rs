@@ -41,6 +41,9 @@ fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Ve
     Some((info.chunk_hashes, info.chunk_boundary_offsets, info.unpacked_chunk_offsets))
 }
 
+/// Concurrent shard-index lookups during the GC liveness check.
+const LIVENESS_LOOKUP_CONCURRENCY: usize = 64;
+
 #[pyclass]
 pub struct ShardIndex {
     sfm: Arc<ShardFileManager>,
@@ -811,9 +814,18 @@ impl ShardIndex {
             None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
         };
 
+        // The GC DB is rebuilt from scratch on every run, so intermediate commits skip
+        // fsync (Durability::None). One Immediate commit at the end persists everything.
+        let begin_fast_write = || -> PyResult<redb::WriteTransaction> {
+            let mut txn = gc_db.begin_write()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+            txn.set_durability(redb::Durability::None)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Set durability failed: {e}")))?;
+            Ok(txn)
+        };
+
         // 1. Insert live files into GC_LIVE_FILES_TABLE in one transaction
-        let write_txn = gc_db.begin_write()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+        let write_txn = begin_fast_write()?;
         {
             let mut files_table = write_txn.open_table(GC_LIVE_FILES_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
@@ -833,8 +845,7 @@ impl ShardIndex {
 
         let flush_chunks = |chunks: &mut Vec<([u8; 32], [u8; 32])>, xorbs: &mut Vec<[u8; 32]>| -> PyResult<()> {
             if chunks.is_empty() && xorbs.is_empty() { return Ok(()); }
-            let write_txn = gc_db.begin_write()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+            let write_txn = begin_fast_write()?;
             {
                 let mut live_table = write_txn.open_table(GC_LIVE_CHUNKS_TABLE)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
@@ -867,17 +878,28 @@ impl ShardIndex {
             let xorb_table = read_txn.open_table(GC_XORB_CHUNKS_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
 
-            for file_hash_hex in &live_file_hashes {
-                let h = match MerkleHash::from_hex(file_hash_hex) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
+            // Resolve reconstructions concurrently. `buffered` (not `buffer_unordered`) keeps
+            // input order, so the first-writer-wins GC_PRIMARY_XORB_TABLE gets the same
+            // result as the old sequential loop.
+            let parsed: Vec<(&String, MerkleHash)> = live_file_hashes.iter()
+                .filter_map(|hex| MerkleHash::from_hex(hex).ok().map(|h| (hex, h)))
+                .collect();
+            let sfm = self.sfm.clone();
+            let lookups = _py.allow_threads(|| {
+                self.rt.block_on(async {
+                    futures::stream::iter(parsed.iter().map(|(_, h)| {
+                        let sfm = sfm.clone();
+                        let h = *h;
+                        async move { sfm.get_file_reconstruction_info(&h).await }
+                    }))
+                    .buffered(LIVENESS_LOOKUP_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await
+                })
+            });
 
-                let res = _py.allow_threads(|| {
-                    self.rt.block_on(async {
-                        self.sfm.get_file_reconstruction_info(&h).await
-                    })
-                }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed for {}: {:?}", file_hash_hex, e)))?;
+            for ((file_hash_hex, _), res) in parsed.iter().zip(lookups) {
+                let res = res.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed for {}: {:?}", file_hash_hex, e)))?;
 
                 let (file_info, _) = match res {
                     Some(r) => r,
@@ -912,6 +934,12 @@ impl ShardIndex {
 
         // Flush any remaining chunks
         flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
+
+        // Persist all Durability::None commits above with a single fsync.
+        let write_txn = gc_db.begin_write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
+        write_txn.commit()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
 
         Ok(())
     }

@@ -71,6 +71,31 @@ fn value_err(e: impl std::fmt::Display) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
 }
 
+/// Lists every object under `prefix` and returns the key suffixes (the xorb hashes).
+/// One LIST request covers 1000 keys, so this replaces a HEAD per xorb for the
+/// common case where the xorb exists. Callers still HEAD anything not listed.
+fn list_key_suffixes(rt: &Runtime, client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> PyResult<HashSet<String>> {
+    rt.block_on(async {
+        let mut keys = HashSet::new();
+        let mut token: Option<String> = None;
+        loop {
+            let resp = s3_list_objects_v2(client, bucket, prefix, token.as_deref(), MAX_S3_ATTEMPTS).await?;
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    if let Some(suffix) = key.strip_prefix(prefix) {
+                        keys.insert(suffix.to_string());
+                    }
+                }
+            }
+            token = resp.next_continuation_token().map(String::from);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok::<_, String>(keys)
+    }).map_err(io_err)
+}
+
 /// Lists `xorbs/default/` page by page and returns the xorbs whose LastModified is at or after `cutoff_unix`.
 pub fn _list_young_xorbs(cutoff_unix: u64) -> PyResult<HashSet<[u8; 32]>> {
     let rt = Runtime::new().unwrap();
@@ -201,6 +226,22 @@ async fn s3_move_object(client: &aws_sdk_s3::Client, bucket: &str, src_key: &str
     }
     Err(format!("Could not move {src_key} to {dest_key} after {MOVE_ATTEMPTS} attempts; the source was kept. Run the step again."))
 }
+
+/// Runs `f` on every item with up to MAX_CONCURRENCY in flight. Stops starting new items
+/// after the first error (items already running finish) and returns that error.
+async fn for_each_concurrent<T, F, Fut>(items: Vec<T>, f: F) -> Result<(), String>
+where
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    use futures::stream::{iter, TryStreamExt};
+    iter(items.into_iter().map(Ok::<T, String>))
+        .try_for_each_concurrent(MAX_CONCURRENCY, f)
+        .await
+}
+
+/// Files looked up per batch in the GC verify scans.
+const VERIFY_LOOKUP_BATCH: usize = 1000;
 
 fn get_current_rss_mb() -> f64 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
@@ -756,43 +797,58 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
         let new_shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
 
+        let new_xorbs: Vec<String> = new_xorbs_table.iter().unwrap().map(|item| item.unwrap().0.value().to_string()).collect();
+        let new_shards: Vec<String> = new_shards_table.iter().unwrap().map(|item| item.unwrap().0.value().to_string()).collect();
+        let old_shards: Vec<String> = old_shards_table.iter().unwrap().map(|item| item.unwrap().0.value().to_string()).collect();
+
+        // The three phases stay in order (new shards reference new xorbs; old shards go only
+        // once their replacements are in place). Items within a phase run concurrently.
         rt.block_on(async {
             // Copy XORBs
-            for item in new_xorbs_table.iter().unwrap() {
-                let (hash_key, _) = item.unwrap();
-                let hash = hash_key.value();
-                let src = format!("{}/gc_consolidated/xorbs/{}", bucket, hash);
-                let dest = format!("xorbs/default/{}", hash);
-                s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, false).await
-                    .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))?;
-            }
-            // Copy Shards
-            for item in new_shards_table.iter().unwrap() {
-                let (hash_key, _) = item.unwrap();
-                let hash = hash_key.value();
-                let src = format!("{}/gc_consolidated/shards/{}.mdb", bucket, hash);
-                let dest = format!("shards/{}.mdb", hash);
-                s3_copy_object(&client, &bucket, &src, &dest, MAX_S3_ATTEMPTS, false).await
-                    .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))?;
-                
-                // Delete any existing tombstone for this new shard (resurrection)
-                let tombstone_key = format!("shards/tombstones/{}.revoked", hash);
-                let _ = s3_delete_object(&client, &bucket, &tombstone_key, MAX_S3_ATTEMPTS).await;
-            }
-            
-            // Tombstone and move old shards
-            for item in old_shards_table.iter().unwrap() {
-                let (hash_key, _) = item.unwrap();
-                let hash_str = hash_key.value();
-                
-                // Move old shard to bin
-                s3_move_object(&client, &bucket, &format!("shards/{hash_str}.mdb"), &format!("bin/shards/{hash_str}.mdb")).await?;
+            eprintln!("[GC Stage] Copying {} new XORBs...", new_xorbs.len());
+            for_each_concurrent(new_xorbs, |hash| {
+                let (client, bucket) = (&client, &bucket);
+                async move {
+                    let src = format!("{}/gc_consolidated/xorbs/{}", bucket, hash);
+                    let dest = format!("xorbs/default/{}", hash);
+                    s3_copy_object(client, bucket, &src, &dest, MAX_S3_ATTEMPTS, false).await
+                        .map(|_| ())
+                        .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))
+                }
+            }).await?;
 
-                // Create tombstone
-                let key = format!("shards/tombstones/{}.revoked", hash_str);
-                s3_put_object(&client, &bucket, &key, Vec::new(), MAX_S3_ATTEMPTS).await
-                    .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))?;
-            }
+            // Copy Shards
+            eprintln!("[GC Stage] Copying {} new shards...", new_shards.len());
+            for_each_concurrent(new_shards, |hash| {
+                let (client, bucket) = (&client, &bucket);
+                async move {
+                    let src = format!("{}/gc_consolidated/shards/{}.mdb", bucket, hash);
+                    let dest = format!("shards/{}.mdb", hash);
+                    s3_copy_object(client, bucket, &src, &dest, MAX_S3_ATTEMPTS, false).await
+                        .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))?;
+
+                    // Delete any existing tombstone for this new shard (resurrection)
+                    let tombstone_key = format!("shards/tombstones/{}.revoked", hash);
+                    let _ = s3_delete_object(client, bucket, &tombstone_key, MAX_S3_ATTEMPTS).await;
+                    Ok(())
+                }
+            }).await?;
+
+            // Tombstone and move old shards
+            eprintln!("[GC Stage] Moving {} old shards to bin...", old_shards.len());
+            for_each_concurrent(old_shards, |hash_str| {
+                let (client, bucket) = (&client, &bucket);
+                async move {
+                    // Move old shard to bin
+                    s3_move_object(client, bucket, &format!("shards/{hash_str}.mdb"), &format!("bin/shards/{hash_str}.mdb")).await?;
+
+                    // Create tombstone
+                    let key = format!("shards/tombstones/{}.revoked", hash_str);
+                    s3_put_object(client, bucket, &key, Vec::new(), MAX_S3_ATTEMPTS).await
+                        .map(|_| ())
+                        .map_err(|e| format!("Failed to put tombstone {}: {:?}", key, e))
+                }
+            }).await?;
 
             // Old XORBs stay in xorbs/default/ until commit: clients may still hold dedup
             // answers that point at them, and commit re-checks whether they came back into use.
@@ -837,42 +893,63 @@ fn _verify_pre_gc_transaction(
     if let Some(ref gcdb) = *gc_db_lock {
         let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
         if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
-            for item in files_table.iter().unwrap() {
-                files_scanned += 1;
-                if files_scanned % 10000 == 0 {
-                    eprintln!("[GC Verify PRE] Phase 2: Scanned {} files (RSS: {} MB)", files_scanned, get_current_rss_mb());
+            // Look files up concurrently in batches; `buffered` keeps table order.
+            let mut file_iter = files_table.iter().unwrap();
+            loop {
+                let chunk: Vec<[u8; 32]> = file_iter.by_ref().take(VERIFY_LOOKUP_BATCH).map(|item| {
+                    let (file_hash_bytes, _) = item.unwrap();
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(file_hash_bytes.value());
+                    h
+                }).collect();
+                if chunk.is_empty() {
+                    break;
                 }
-                
-                let (file_hash_bytes, _) = item.unwrap();
-                let mut h = [0u8; 32];
-                h.copy_from_slice(file_hash_bytes.value());
-                let file_hash_hex = MerkleHash::from(h).hex();
-                
-                let mut xorb_deps = Vec::new();
-                let mut found = true;
-                
-                let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
-                
-                match res {
-                    Ok(Some((info, _))) => {
-                        for segment in info.segments {
-                            xorb_deps.push(segment.xorb_hash.hex());
-                        }
-                    },
-                    _ => {
-                        found = false;
+                let lookups = rt.block_on(async {
+                    futures::stream::StreamExt::collect::<Vec<_>>(
+                        futures::stream::StreamExt::buffered(
+                            futures::stream::iter(chunk.iter().map(|h| {
+                                let sfm = verify_sfm.clone();
+                                let mh = MerkleHash::from(*h);
+                                async move { sfm.get_file_reconstruction_info(&mh).await }
+                            })),
+                            MAX_CONCURRENCY,
+                        )
+                    ).await
+                });
+                for (h, res) in chunk.into_iter().zip(lookups) {
+                    files_scanned += 1;
+                    if files_scanned % 10000 == 0 {
+                        eprintln!("[GC Verify PRE] Phase 2: Scanned {} files (RSS: {} MB)", files_scanned, get_current_rss_mb());
                     }
-                }
                 
-                if !found {
-                    missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-                    missing_count += 1;
-                    continue;
-                }
+                    let file_hash_hex = MerkleHash::from(h).hex();
                 
-                // Validate XORBs - removed old_xorbs_table check to avoid false positives for repacked files
-                for xh in &xorb_deps {
-                    unique_xorbs_table.insert(xh.as_str(), ()).unwrap();
+                    let mut xorb_deps = Vec::new();
+                    let mut found = true;
+                
+                
+                    match res {
+                        Ok(Some((info, _))) => {
+                            for segment in info.segments {
+                                xorb_deps.push(segment.xorb_hash.hex());
+                            }
+                        },
+                        _ => {
+                            found = false;
+                        }
+                    }
+                
+                    if !found {
+                        missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+                        missing_count += 1;
+                        continue;
+                    }
+                
+                    // Validate XORBs - removed old_xorbs_table check to avoid false positives for repacked files
+                    for xh in &xorb_deps {
+                        unique_xorbs_table.insert(xh.as_str(), ()).unwrap();
+                    }
                 }
             }
         }
@@ -914,10 +991,17 @@ fn _verify_pre_gc_transaction(
         Ok(())
     };
 
+    let listed_live = list_key_suffixes(rt, client, bucket, "xorbs/default/")?;
+    eprintln!("[GC Verify PRE] Phase 3: Listed {} XORBs on S3; checking unlisted ones individually", listed_live.len());
+
     let mut xorbs_scanned = 0;
     for item in unique_xorbs_table.iter().unwrap() {
         let (k, _) = item.unwrap();
-        batch.push(k.value().to_string());
+        let xh = k.value().to_string();
+        if listed_live.contains(&xh) {
+            continue;
+        }
+        batch.push(xh);
         if batch.len() >= 100 {
             process_batch(&mut batch)?;
             xorbs_scanned += 100;
@@ -1054,40 +1138,61 @@ fn _verify_post_gc_transaction(
     if let Some(ref gcdb) = *gc_db_lock {
         let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
         if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
-            for item in files_table.iter().unwrap() {
-                files_scanned += 1;
-                if files_scanned % 10000 == 0 {
-                    eprintln!("[GC Verify POST] Phase 2: Scanned {} files", files_scanned);
+            // Look files up concurrently in batches; `buffered` keeps table order.
+            let mut file_iter = files_table.iter().unwrap();
+            loop {
+                let chunk: Vec<[u8; 32]> = file_iter.by_ref().take(VERIFY_LOOKUP_BATCH).map(|item| {
+                    let (file_hash_bytes, _) = item.unwrap();
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(file_hash_bytes.value());
+                    h
+                }).collect();
+                if chunk.is_empty() {
+                    break;
                 }
+                let lookups = rt.block_on(async {
+                    futures::stream::StreamExt::collect::<Vec<_>>(
+                        futures::stream::StreamExt::buffered(
+                            futures::stream::iter(chunk.iter().map(|h| {
+                                let sfm = verify_sfm.clone();
+                                let mh = MerkleHash::from(*h);
+                                async move { sfm.get_file_reconstruction_info(&mh).await }
+                            })),
+                            MAX_CONCURRENCY,
+                        )
+                    ).await
+                });
+                for (h, res) in chunk.into_iter().zip(lookups) {
+                    files_scanned += 1;
+                    if files_scanned % 10000 == 0 {
+                        eprintln!("[GC Verify POST] Phase 2: Scanned {} files", files_scanned);
+                    }
                 
-                let (file_hash_bytes, _) = item.unwrap();
-                let mut h = [0u8; 32];
-                h.copy_from_slice(file_hash_bytes.value());
-                let file_hash_hex = MerkleHash::from(h).hex();
+                    let file_hash_hex = MerkleHash::from(h).hex();
                 
-                let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
-                let mut found_old_xorb = false;
-                match res {
-                    Ok(Some((info, _))) => {
-                        for segment in info.segments {
-                            let xh = segment.xorb_hash.hex();
-                            if old_xorbs_table.get(xh.as_str()).unwrap().is_some() {
-                                found_old_xorb = true;
-                                break;
+                    let mut found_old_xorb = false;
+                    match res {
+                        Ok(Some((info, _))) => {
+                            for segment in info.segments {
+                                let xh = segment.xorb_hash.hex();
+                                if old_xorbs_table.get(xh.as_str()).unwrap().is_some() {
+                                    found_old_xorb = true;
+                                    break;
+                                }
+                                post_xorbs_table.insert(xh.as_str(), ()).unwrap();
                             }
-                            post_xorbs_table.insert(xh.as_str(), ()).unwrap();
+                        },
+                        _ => {
+                            missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
+                            missing_count += 1;
+                            continue;
                         }
-                    },
-                    _ => {
+                    }
+                
+                    if found_old_xorb {
                         missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
                         missing_count += 1;
-                        continue;
                     }
-                }
-                
-                if found_old_xorb {
-                    missing_table.insert(file_hash_hex.as_str(), ()).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
-                    missing_count += 1;
                 }
             }
         }
@@ -1139,10 +1244,19 @@ fn _verify_post_gc_transaction(
         Ok(())
     };
 
+    let listed_live = list_key_suffixes(rt, client, bucket, "xorbs/default/")?;
+    let listed_new = list_key_suffixes(rt, client, bucket, "gc_consolidated/xorbs/")?;
+    eprintln!("[GC Verify POST] Phase 3: Listed {} live and {} consolidated XORBs on S3; checking unlisted ones individually", listed_live.len(), listed_new.len());
+
     let mut xorbs_scanned = 0;
     for item in post_xorbs_table.iter().unwrap() {
         let (k, _) = item.unwrap();
-        batch.push(k.value().to_string());
+        let xh = k.value().to_string();
+        let listed = if new_xorbs.contains(&xh) { &listed_new } else { &listed_live };
+        if listed.contains(&xh) {
+            continue;
+        }
+        batch.push(xh);
         if batch.len() >= 100 {
             process_batch(&mut batch)?;
             xorbs_scanned += 100;
@@ -1361,12 +1475,14 @@ pub fn _commit_gc_transaction(
             }
         }
 
-        rt.block_on(async {
-            for hash_str in &to_move {
-                s3_move_object(&client, &bucket, &format!("xorbs/default/{hash_str}"), &format!("bin/xorbs/{hash_str}")).await?;
+        eprintln!("[GC Commit] Moving {} old XORBs to bin...", to_move.len());
+        rt.block_on(for_each_concurrent(to_move.clone(), |hash_str| {
+            let (client, bucket) = (&client, &bucket);
+            async move {
+                s3_move_object(client, bucket, &format!("xorbs/default/{hash_str}"), &format!("bin/xorbs/{hash_str}")).await
+                    .map(|_| ())
             }
-            Ok::<_, String>(())
-        }).map_err(io_err)?;
+        })).map_err(io_err)?;
         moved = to_move;
 
         let mut kept_table = write_txn.open_table(TXN_KEPT_XORBS_TABLE).map_err(io_err)?;
