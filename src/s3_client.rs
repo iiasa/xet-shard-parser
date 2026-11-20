@@ -264,10 +264,13 @@ pub async fn s3_put_object(
     loop {
         attempts += 1;
         let body = ByteStream::from(data_bytes.clone());
+        // The CRC32 makes S3 reject the upload if the bytes arrive different
+        // (XAmzContentChecksumMismatch). Explicit rather than relying on the SDK default.
         match client.put_object()
             .bucket(bucket)
             .key(key)
             .body(body)
+            .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
             .send()
             .await 
         {
@@ -314,6 +317,43 @@ pub async fn s3_copy_object(
             }
         }
     }
+}
+
+/// HEADs an object and returns (ETag, size), or None if it doesn't exist.
+pub async fn s3_head_etag_size(client: &Client, bucket: &str, key: &str, max_attempts: u32) -> Result<Option<(String, i64)>, String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match client.head_object().bucket(bucket).key(key).send().await {
+            Ok(h) => return Ok(Some((h.e_tag().unwrap_or_default().to_string(), h.content_length().unwrap_or(-1)))),
+            Err(e) => match classify_head_error(&e) {
+                S3ResponseClassification::ObjectNotFound => return Ok(None),
+                S3ResponseClassification::TransientRetryable if attempts < max_attempts => {
+                    tokio::time::sleep(calculate_backoff(attempts)).await;
+                }
+                S3ResponseClassification::TransientRetryable => {
+                    return Err(format!("Exhausted {max_attempts} retries reading metadata of {key}: {e:?}"));
+                }
+                S3ResponseClassification::CriticalFatal(msg) => return Err(format!("HEAD {key} failed: {msg}")),
+            },
+        }
+    }
+}
+
+/// Copies `src_key` to `dest_key` in the same bucket, then checks the copy against the source:
+/// same size, and the same ETag (the MD5 of the content) when the source was a single-part
+/// upload. Multipart ETags are not content MD5s, so for those only the size is compared.
+pub async fn s3_copy_object_verified(client: &Client, bucket: &str, src_key: &str, dest_key: &str, max_attempts: u32) -> Result<(), String> {
+    s3_copy_object(client, bucket, &format!("{bucket}/{src_key}"), dest_key, max_attempts, false).await?;
+    let src = s3_head_etag_size(client, bucket, src_key, max_attempts).await?
+        .ok_or_else(|| format!("Copy source {src_key} disappeared"))?;
+    let dest = s3_head_etag_size(client, bucket, dest_key, max_attempts).await?
+        .ok_or_else(|| format!("Copy of {src_key} is missing at {dest_key}"))?;
+    let etag_comparable = !src.0.is_empty() && !src.0.contains('-');
+    if src.1 != dest.1 || (etag_comparable && src.0 != dest.0) {
+        return Err(format!("Copy of {src_key} to {dest_key} differs: source (etag {}, {} bytes), copy (etag {}, {} bytes)", src.0, src.1, dest.0, dest.1));
+    }
+    Ok(())
 }
 
 /// Deletes an S3 object with retries. Treats NoSuchKey/404 as successful idempotent deletion.

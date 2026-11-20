@@ -17,7 +17,7 @@ use mdb_shard::metadata_shard::ShardFileManager;
 use mdb_shard::metadata_shard::{MDBShardFileFooter, MDBShardFileHeader, MDBShardInfo};
 use mdb_shard::xorb_object::XorbObject;
 
-use crate::s3_client::{create_s3_client, s3_download_range, MAX_CONCURRENCY, MAX_S3_ATTEMPTS};
+use crate::s3_client::{create_s3_client, s3_download_object, s3_download_range, MAX_CONCURRENCY, MAX_S3_ATTEMPTS};
 
 /// A trusted chunk list: (chunk hash, unpacked size) per chunk, in xorb order.
 pub type ChunkList = Vec<(MerkleHash, u32)>;
@@ -291,6 +291,112 @@ pub async fn verify_shard(
     Ok(())
 }
 
+/// Result of `deep_audit_shards`.
+#[derive(Default)]
+pub struct DeepAuditReport {
+    pub shards_checked: usize,
+    /// File entries of live files checked (a file can have entries in several shards).
+    pub entries_checked: usize,
+    /// (file hash hex, reason, shard hash hex): entries that don't describe their file exactly.
+    pub bad_entries: Vec<(String, String, String)>,
+    pub blocks_checked: usize,
+    /// (xorb hash hex, shard hash hex): CAS info blocks whose chunk hashes or sizes differ from
+    /// the xorb's footer. Uploads that reuse chunks rely on these, so this is a real problem.
+    pub blocks_wrong_chunks: Vec<(String, String)>,
+    /// Blocks right in chunks and sizes but with positions written the old GC way. Harmless.
+    pub blocks_old_positions: usize,
+    /// Blocks for xorbs that are not in S3.
+    pub blocks_xorb_missing: usize,
+}
+
+/// Read-only check of every registered shard against the xorb footers in S3:
+/// - every file entry of a live file must describe its file exactly (`check_file_layout`:
+///   chunk ranges, sizes, verification hashes if present, file hash). All entries are checked,
+///   not just the first one found for a file;
+/// - every CAS info block must list the same chunks and sizes as its xorb's footer.
+pub async fn deep_audit_shards(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    shards: &[(String, std::path::PathBuf)],
+    live: &HashSet<MerkleHash>,
+) -> Result<DeepAuditReport, String> {
+    use futures::stream::{iter, StreamExt};
+    let mut report = DeepAuditReport::default();
+    let mut chunk_lists: HashMap<MerkleHash, Option<ChunkList>> = HashMap::new();
+
+    for (n, (shard_hash, path)) in shards.iter().enumerate() {
+        let bytes = std::fs::read(path).map_err(|e| format!("Cannot read shard {shard_hash}: {e}"))?;
+        let shard = MDBMinimalShard::from_reader(&mut Cursor::new(&bytes), true, true)
+            .map_err(|e| format!("Cannot parse shard {shard_hash}: {e:?}"))?;
+        let mut files = Vec::new();
+        for i in 0..shard.num_files() {
+            let view = shard.file(i).ok_or_else(|| format!("Cannot read file entry {i} of {shard_hash}"))?;
+            if live.contains(&view.file_hash()) {
+                files.push(MDBFileInfo::from(view));
+            }
+        }
+        let mut cas_infos = Vec::with_capacity(shard.num_xorb());
+        for i in 0..shard.num_xorb() {
+            let view = shard.xorb(i).ok_or_else(|| format!("Cannot read CAS info block {i} of {shard_hash}"))?;
+            cas_infos.push(MDBXorbInfo::from(view));
+        }
+
+        if chunk_lists.len() > GC_CHECK_FOOTER_CACHE {
+            chunk_lists.clear();
+        }
+        let wanted: HashSet<MerkleHash> = files.iter()
+            .flat_map(|f| f.segments.iter().map(|s| s.xorb_hash))
+            .chain(cas_infos.iter().map(|c| c.metadata.xorb_hash))
+            .filter(|h| !chunk_lists.contains_key(h))
+            .collect();
+        // Each footer is parsed as soon as it arrives and the 1 MiB download dropped, so at most
+        // MAX_CONCURRENCY downloads are in memory at once, however many xorbs the shard uses.
+        let fetched = iter(wanted.into_iter().map(|h| async move {
+            let key = format!("xorbs/default/{}", h.hex());
+            let res = s3_download_range(client, bucket, &key, "bytes=-1048576", MAX_S3_ATTEMPTS, false).await
+                .map(|footer| footer.and_then(|f| chunk_list_from_xorb_footer(&f)));
+            (h, res)
+        }))
+        .buffer_unordered(MAX_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for (h, res) in fetched {
+            chunk_lists.insert(h, res?);
+        }
+        let known: HashMap<MerkleHash, ChunkList> = chunk_lists.iter()
+            .filter_map(|(h, l)| l.as_ref().map(|l| (*h, l.clone())))
+            .collect();
+
+        for info in &cas_infos {
+            report.blocks_checked += 1;
+            let h = info.metadata.xorb_hash;
+            match known.get(&h) {
+                None => report.blocks_xorb_missing += 1,
+                Some(list) => {
+                    let same_chunks = info.chunks.len() == list.len()
+                        && info.chunks.iter().zip(list.iter()).all(|(c, (lh, ls))| c.chunk_hash == *lh && c.unpacked_segment_bytes == *ls);
+                    if !same_chunks {
+                        report.blocks_wrong_chunks.push((h.hex(), shard_hash.clone()));
+                    } else if !check_cas_info(info, list) {
+                        report.blocks_old_positions += 1;
+                    }
+                }
+            }
+        }
+        for file in &files {
+            report.entries_checked += 1;
+            if let Err((reason, detail)) = check_file_layout(file, &known) {
+                report.bad_entries.push((file.metadata.file_hash.hex(), format!("{reason} ({detail})"), shard_hash.clone()));
+            }
+        }
+        report.shards_checked += 1;
+        if (n + 1) % 100 == 0 {
+            eprintln!("[Deep audit] {}/{} shards, {} entries checked, {} bad", n + 1, shards.len(), report.entries_checked, report.bad_entries.len());
+        }
+    }
+    Ok(report)
+}
+
 /// Returns a copy of `shard_bytes` with the footer's `shard_key_expiry` set to `expiry_unix`.
 /// Shards without a footer are returned unchanged.
 pub fn with_dedup_expiry(shard_bytes: &[u8], expiry_unix: u64) -> Result<Vec<u8>, String> {
@@ -487,3 +593,150 @@ mod real_shard_tests {
     }
 }
 
+
+/// Checks that a file entry describes its file correctly, given the real chunk lists of the
+/// xorbs it points at: every segment's chunk range lies inside its xorb, has the recorded size,
+/// matches the segment's verification hash (when the entry has verification hashes; entries
+/// uploaded before verification existed have none), and the chunks of all segments together
+/// give the file's hash.
+fn check_file_layout(file: &MDBFileInfo, trusted: &HashMap<MerkleHash, ChunkList>) -> Result<(), Failure> {
+    let has_verification = file.verification.len() == file.segments.len();
+    let mut all_chunks: Vec<(MerkleHash, u64)> = Vec::new();
+    for (i, seg) in file.segments.iter().enumerate() {
+        let Some(chunks) = trusted.get(&seg.xorb_hash) else {
+            return Err(fail(XORB_NOT_FOUND, seg.xorb_hash.hex()));
+        };
+        let (start, end) = (seg.chunk_index_start as usize, seg.chunk_index_end as usize);
+        if start >= end || end > chunks.len() {
+            return Err(fail(BAD_RANGE, seg.xorb_hash.hex()));
+        }
+        let range = &chunks[start..end];
+        if range.iter().map(|(_, s)| *s as u64).sum::<u64>() != seg.unpacked_segment_bytes as u64 {
+            return Err(fail(BAD_RANGE, seg.xorb_hash.hex()));
+        }
+        if has_verification {
+            let hashes: Vec<MerkleHash> = range.iter().map(|(h, _)| *h).collect();
+            if range_hash_from_chunks(&hashes) != file.verification[i].range_hash {
+                return Err(fail(BAD_VERIFICATION_HASH, seg.xorb_hash.hex()));
+            }
+        }
+        all_chunks.extend(range.iter().map(|(h, s)| (*h, *s as u64)));
+    }
+    if file_hash(&all_chunks) != file.metadata.file_hash {
+        return Err(fail(BAD_FILE_HASH, file.metadata.file_hash.hex()));
+    }
+    Ok(())
+}
+
+/// Reason for a file entry in a shard that survives GC but points at a xorb commit deletes.
+pub const XORB_TO_BE_DELETED: &str = "points_at_xorb_to_be_deleted";
+
+/// Reason for a new xorb whose name is not the xorb hash recorded in its own footer.
+pub const XORB_NAME_MISMATCH: &str = "xorb_name_mismatch";
+
+/// Footer chunk lists kept in memory at once by `check_gc_shard_entries`; the cache is
+/// cleared past this, so memory stays bounded however many xorbs the new shards use.
+const GC_CHECK_FOOTER_CACHE: usize = 2048;
+
+/// Checks the shards a GC run wrote (`gc_consolidated/shards/`) against the footers of the
+/// xorbs they point at (new xorbs from `gc_consolidated/xorbs/`, others from `xorbs/default/`):
+/// - every file entry must describe its file exactly (ranges, sizes, verification and file hashes);
+/// - every CAS info block must match its xorb's footer (chunks, sizes, unpacked positions);
+/// - every new xorb must be named by the xorb hash in its own footer;
+/// - no file entry may point at a xorb in `old_xorbs` (deleted at commit).
+///
+/// Adds the hash of every xorb with a CAS info block in the new shards to `blocks_seen`.
+///
+/// Returns (file entries checked, failures as (file or xorb hash hex, reason)).
+pub async fn check_gc_shard_entries(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    new_shards: &[String],
+    new_xorbs: &HashSet<String>,
+    old_xorbs: &HashSet<String>,
+    blocks_seen: &mut HashSet<String>,
+) -> Result<(usize, Vec<(String, String)>), String> {
+    use futures::stream::{iter, StreamExt};
+    let mut chunk_lists: HashMap<MerkleHash, ChunkList> = HashMap::new();
+    let mut names_checked: HashSet<MerkleHash> = HashSet::new();
+    let mut checked = 0;
+    let mut failures = Vec::new();
+
+    for shard_hash in new_shards {
+        let key = format!("gc_consolidated/shards/{shard_hash}.mdb");
+        let bytes = s3_download_object(client, bucket, &key, MAX_S3_ATTEMPTS, true).await?
+            .ok_or_else(|| format!("New shard {key} not found"))?;
+        let shard = MDBMinimalShard::from_reader(&mut Cursor::new(&bytes), true, true)
+            .map_err(|e| format!("Cannot parse new shard {key}: {e:?}"))?;
+        let mut files = Vec::with_capacity(shard.num_files());
+        for i in 0..shard.num_files() {
+            let view = shard.file(i).ok_or_else(|| format!("Cannot read file entry {i} of {key}"))?;
+            files.push(MDBFileInfo::from(view));
+        }
+        let mut cas_infos = Vec::with_capacity(shard.num_xorb());
+        for i in 0..shard.num_xorb() {
+            let view = shard.xorb(i).ok_or_else(|| format!("Cannot read CAS info block {i} of {key}"))?;
+            cas_infos.push(MDBXorbInfo::from(view));
+        }
+
+        if chunk_lists.len() > GC_CHECK_FOOTER_CACHE {
+            chunk_lists.clear();
+        }
+        let wanted: HashSet<MerkleHash> = files.iter()
+            .flat_map(|f| f.segments.iter().map(|s| s.xorb_hash))
+            .chain(cas_infos.iter().map(|c| c.metadata.xorb_hash))
+            .filter(|h| !chunk_lists.contains_key(h))
+            .collect();
+        let fetched = iter(wanted.into_iter().map(|h| {
+            let hex = h.hex();
+            let is_new = new_xorbs.contains(&hex);
+            let key = if is_new { format!("gc_consolidated/xorbs/{hex}") } else { format!("xorbs/default/{hex}") };
+            // Parsed as soon as it arrives, keeping only (hash in the footer, chunk list): at most
+            // MAX_CONCURRENCY 1 MiB downloads are in memory at once.
+            async move {
+                let res = s3_download_range(client, bucket, &key, "bytes=-1048576", MAX_S3_ATTEMPTS, false).await
+                    .map(|footer| footer.and_then(|f| {
+                        let xorb = XorbObject::deserialize(&mut Cursor::new(&f)).ok()?;
+                        Some((xorb.info.xorb_hash, chunk_list_from_xorb_footer(&f)))
+                    }));
+                (h, is_new, res)
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for (h, is_new, res) in fetched {
+            let Some((footer_hash, list)) = res? else { continue };
+            if is_new && names_checked.insert(h) && footer_hash != h {
+                failures.push((h.hex(), format!("{XORB_NAME_MISMATCH} (footer says {})", footer_hash.hex())));
+            }
+            if let Some(list) = list {
+                chunk_lists.insert(h, list);
+            }
+        }
+
+        for info in &cas_infos {
+            let h = info.metadata.xorb_hash;
+            blocks_seen.insert(h.hex());
+            match chunk_lists.get(&h) {
+                None => failures.push((h.hex(), format!("{XORB_NOT_FOUND} (CAS info block) in shard {shard_hash}"))),
+                Some(list) if !check_cas_info(info, list) => {
+                    failures.push((h.hex(), format!("{CAS_INFO_MISMATCH} in shard {shard_hash}")))
+                }
+                Some(_) => {}
+            }
+        }
+        for file in &files {
+            checked += 1;
+            if let Some(seg) = file.segments.iter().find(|s| old_xorbs.contains(&s.xorb_hash.hex())) {
+                failures.push((file.metadata.file_hash.hex(), format!(
+                    "{XORB_TO_BE_DELETED} ({}) in shard {shard_hash}", seg.xorb_hash.hex())));
+                continue;
+            }
+            if let Err((reason, detail)) = check_file_layout(file, &chunk_lists) {
+                failures.push((file.metadata.file_hash.hex(), format!("{reason} ({detail}) in shard {shard_hash}")));
+            }
+        }
+    }
+    Ok((checked, failures))
+}

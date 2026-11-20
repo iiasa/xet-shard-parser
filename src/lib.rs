@@ -41,8 +41,50 @@ fn parse_xorb_footer_data(bytes: &[u8]) -> Option<(Vec<MerkleHash>, Vec<u32>, Ve
     Some((info.chunk_hashes, info.chunk_boundary_offsets, info.unpacked_chunk_offsets))
 }
 
-/// Concurrent shard-index lookups during the GC liveness check.
+/// Shard-index lookups in flight during the GC liveness check (spread over the runtime's
+/// worker threads), and how many files are looked up per group.
 const LIVENESS_LOOKUP_CONCURRENCY: usize = 64;
+const LIVENESS_LOOKUP_GROUP: usize = 512;
+/// Live chunks buffered per GC DB commit in the liveness check (~64 bytes each).
+const LIVENESS_FLUSH_CHUNKS: usize = 250_000;
+
+/// Where a file's entry can be read from, for the liveness check.
+enum GcFileLoc {
+    /// Every entry for this file (in one shard or several) has the same segments, so reading
+    /// this shard gives the liveness check exactly what the shard manager's lookup would.
+    Uniform(Arc<mdb_shard::metadata_shard::MDBShardFile>),
+    /// Entries in different shards disagree: the shard manager's own order decides, so the
+    /// full lookup is used.
+    Conflicting,
+}
+
+/// Which shard to read each file entry from, built by `init_gc` for the liveness check.
+///
+/// The shard manager answers a file lookup by opening shard after shard until one has the
+/// file, which costs one file open per registered shard for every file. This map turns that
+/// into one open per file, without changing any result:
+/// - entries whose segments agree across all shards are read from one of those shards;
+/// - conflicting entries still use the shard manager's lookup;
+/// - a file in no registered shard is reported as not found, which is what the shard
+///   manager's search over the same shards returns (this crate never adds in-memory entries).
+struct GcFileShardMap {
+    /// Shards registered when the map was built; it is only used while this is unchanged.
+    shard_hashes: std::collections::HashSet<[u8; 32]>,
+    files: std::collections::HashMap<[u8; 32], GcFileLoc>,
+}
+
+/// Hash of the parts of a file entry the liveness check uses (and the rest of each segment).
+fn segments_hash(file_info: &mdb_shard::metadata_shard::file_structs::MDBFileInfo) -> MerkleHash {
+    let mut buf = Vec::with_capacity(file_info.segments.len() * 48);
+    for seg in &file_info.segments {
+        buf.extend_from_slice(seg.xorb_hash.as_bytes());
+        buf.extend_from_slice(&seg.xorb_flags.to_le_bytes());
+        buf.extend_from_slice(&seg.unpacked_segment_bytes.to_le_bytes());
+        buf.extend_from_slice(&seg.chunk_index_start.to_le_bytes());
+        buf.extend_from_slice(&seg.chunk_index_end.to_le_bytes());
+    }
+    compute_data_hash(&buf)
+}
 
 #[pyclass]
 pub struct ShardIndex {
@@ -52,6 +94,7 @@ pub struct ShardIndex {
     client: Client,
     gc_db: Arc<std::sync::RwLock<Option<redb::Database>>>,
     gc_db_path: Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
+    gc_file_shards: Arc<std::sync::RwLock<Option<Arc<GcFileShardMap>>>>,
 }
 
 #[pymethods]
@@ -87,6 +130,7 @@ impl ShardIndex {
             client,
             gc_db: Arc::new(std::sync::RwLock::new(None)),
             gc_db_path: Arc::new(std::sync::RwLock::new(None)),
+            gc_file_shards: Arc::new(std::sync::RwLock::new(None)),
         };
 
         // Trigger an initial refresh with the size limit
@@ -193,9 +237,16 @@ impl ShardIndex {
     ///
     /// `started_at` is the unix time start began (before the liveness check). Xorbs whose S3
     /// LastModified is less than `min_age_days` before `started_at` are never removed or
-    /// repacked by this run.
-    #[pyo3(signature = (started_at, min_age_days=28.0))]
-    pub fn start_gc_transaction(&self, py: Python<'_>, started_at: u64, min_age_days: f64) -> PyResult<bool> {
+    /// repacked by this run. `drop_entries`: (file hash hex, shard hash hex) of file entries to
+    /// leave out of the rewritten shards (from `audit --deep`); their shards are always rewritten.
+    #[pyo3(signature = (started_at, min_age_days=28.0, drop_entries=Vec::new()))]
+    pub fn start_gc_transaction(&self, py: Python<'_>, started_at: u64, min_age_days: f64, drop_entries: Vec<(String, String)>) -> PyResult<bool> {
+        let mut drop_set: std::collections::HashSet<([u8; 32], String)> = std::collections::HashSet::new();
+        for (file_hex, shard_hex) in drop_entries {
+            let h = MerkleHash::from_hex(&file_hex)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid file hash {file_hex}: {e:?}")))?;
+            drop_set.insert((h.into(), shard_hex));
+        }
         let has_sparse = py.allow_threads(|| {
             let gc_db_lock = self.gc_db.read().unwrap();
             if gc_db_lock.is_none() {
@@ -218,14 +269,14 @@ impl ShardIndex {
             let read_txn = db.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn failed: {e}")))?;
             let sparse_xorbs = read_txn.open_table(blender::GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
             
-            if sparse_xorbs.is_empty().unwrap_or(true) && !self.any_file_entry_references_missing_xorb(db)? {
+            if drop_set.is_empty() && sparse_xorbs.is_empty().unwrap_or(true) && !self.any_file_entry_references_missing_xorb(db)? {
                 return Ok(false);
             }
             
             drop(read_txn);
             drop(gc_db_lock);
             
-            blender::_consolidate_metadata(self.sfm.clone(), self.gc_db.clone(), started_at)?;
+            blender::_consolidate_metadata(self.sfm.clone(), self.gc_db.clone(), started_at, &drop_set)?;
             Ok(true)
         })?;
         Ok(has_sparse)
@@ -646,6 +697,8 @@ impl ShardIndex {
 
         // Close any prior GC database handle first and remove old file if present
         *self.gc_db.write().unwrap() = None;
+        *self.gc_file_shards.write().unwrap() = None;
+        let mut gc_file_map: Option<GcFileShardMap> = None;
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
@@ -715,19 +768,38 @@ impl ShardIndex {
                 }
             }
 
-            // Second pass: find any XORBs referenced by file segments whose MDBXorbInfo block was omitted in an earlier GC run
+            // Second pass: find any XORBs referenced by file segments whose MDBXorbInfo block was omitted in an earlier GC run.
+            // The same pass records which shard holds each file entry (see GcFileShardMap).
+            // While building: the shard to read and the hash of its segments, or None once two
+            // entries for the file disagree.
+            let mut file_shards: std::collections::HashMap<[u8; 32], Option<(Arc<mdb_shard::metadata_shard::MDBShardFile>, MerkleHash)>> =
+                std::collections::HashMap::new();
+            let mut file_map_complete = true;
             for shard_file in &shards {
                 let mut reader = match shard_file.get_reader() {
                     Ok(r) => r,
-                    Err(_) => continue,
+                    Err(_) => { file_map_complete = false; continue },
                 };
                 let m_shard = match MDBMinimalShard::from_reader(&mut reader, true, false) {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(_) => { file_map_complete = false; continue },
                 };
                 for i in 0..m_shard.num_files() {
                     if let Some(file_view) = m_shard.file(i) {
                         let file_info = mdb_shard::metadata_shard::file_structs::MDBFileInfo::from(file_view);
+                        let file_h: [u8; 32] = file_info.metadata.file_hash.into();
+                        let seg_h = segments_hash(&file_info);
+                        match file_shards.entry(file_h) {
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(Some((shard_file.clone(), seg_h)));
+                            },
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                let agrees = matches!(e.get(), Some((_, h)) if *h == seg_h);
+                                if !agrees {
+                                    e.insert(None);
+                                }
+                            },
+                        }
                         for seg in &file_info.segments {
                             let xorb_h_bytes: [u8; 32] = seg.xorb_hash.into();
                             if xorb_chunks_table.get(&xorb_h_bytes).unwrap_or(None).is_none() {
@@ -736,6 +808,23 @@ impl ShardIndex {
                         }
                     }
                 }
+            }
+
+            if file_map_complete {
+                let files: std::collections::HashMap<[u8; 32], GcFileLoc> = file_shards.into_iter()
+                    .map(|(file_h, loc)| (file_h, match loc {
+                        Some((shard, _)) => GcFileLoc::Uniform(shard),
+                        None => GcFileLoc::Conflicting,
+                    }))
+                    .collect();
+                let conflicting = files.values().filter(|v| matches!(v, GcFileLoc::Conflicting)).count();
+                eprintln!("[GC Init] File-to-shard map: {} files read directly, {} with conflicting entries across shards (full lookup).", files.len() - conflicting, conflicting);
+                gc_file_map = Some(GcFileShardMap {
+                    shard_hashes: shards.iter().map(|s| <[u8; 32]>::from(s.shard_hash)).collect(),
+                    files,
+                });
+            } else {
+                eprintln!("[GC Init] A shard could not be read; liveness lookups will all use the full lookup.");
             }
 
             if !missing_xorb_info.is_empty() {
@@ -792,12 +881,14 @@ impl ShardIndex {
 
         *self.gc_db.write().unwrap() = Some(db);
         *self.gc_db_path.write().unwrap() = Some(path);
+        *self.gc_file_shards.write().unwrap() = gc_file_map.map(Arc::new);
         Ok(())
     }
 
     #[pyo3(signature = ())]
     pub fn cleanup_gc(&self, _py: Python<'_>) -> PyResult<()> {
         *self.gc_db.write().unwrap() = None;
+        *self.gc_file_shards.write().unwrap() = None;
         if let Some(path) = self.gc_db_path.write().unwrap().take() {
             if path.exists() {
                 let _ = std::fs::remove_file(path);
@@ -814,18 +905,9 @@ impl ShardIndex {
             None => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("GC DB not initialized. Call init_gc first.")),
         };
 
-        // The GC DB is rebuilt from scratch on every run, so intermediate commits skip
-        // fsync (Durability::None). One Immediate commit at the end persists everything.
-        let begin_fast_write = || -> PyResult<redb::WriteTransaction> {
-            let mut txn = gc_db.begin_write()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
-            txn.set_durability(redb::Durability::None)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Set durability failed: {e}")))?;
-            Ok(txn)
-        };
-
         // 1. Insert live files into GC_LIVE_FILES_TABLE in one transaction
-        let write_txn = begin_fast_write()?;
+        let write_txn = gc_db.begin_write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
         {
             let mut files_table = write_txn.open_table(GC_LIVE_FILES_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
@@ -840,12 +922,13 @@ impl ShardIndex {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
 
         // 2. Query XORB chunks from GC_XORB_CHUNKS_TABLE and stream chunks to live tables
-        let mut chunks_to_insert: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(10000);
+        let mut chunks_to_insert: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(LIVENESS_FLUSH_CHUNKS);
         let mut xorbs_to_insert: Vec<[u8; 32]> = Vec::with_capacity(1000);
 
         let flush_chunks = |chunks: &mut Vec<([u8; 32], [u8; 32])>, xorbs: &mut Vec<[u8; 32]>| -> PyResult<()> {
             if chunks.is_empty() && xorbs.is_empty() { return Ok(()); }
-            let write_txn = begin_fast_write()?;
+            let write_txn = gc_db.begin_write()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
             {
                 let mut live_table = write_txn.open_table(GC_LIVE_CHUNKS_TABLE)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
@@ -854,12 +937,26 @@ impl ShardIndex {
                 let mut live_xorbs_table = write_txn.open_table(GC_LIVE_XORBS_TABLE)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
 
-                for xorb_h in xorbs.iter() {
+                // Same table contents as inserting in arrival order, with far fewer B-tree
+                // operations: every live xorb once, in key order.
+                let live_xorbs: std::collections::BTreeSet<[u8; 32]> = xorbs.iter().copied()
+                    .chain(chunks.iter().map(|(_, xorb_h)| *xorb_h))
+                    .collect();
+                for xorb_h in &live_xorbs {
                     let _ = live_xorbs_table.insert(xorb_h, &());
                 }
+                // The sort is stable: for a chunk seen more than once, its first occurrence
+                // stays first, so first-writer-wins in GC_PRIMARY_XORB_TABLE is unchanged.
+                // Later occurrences would only repeat a no-op insert and a lookup that finds
+                // the primary already set, so they are skipped.
+                chunks.sort_by_key(|(chunk_h, _)| *chunk_h);
+                let mut prev_chunk: Option<[u8; 32]> = None;
                 for (chunk_h, xorb_h) in chunks.iter() {
+                    if prev_chunk == Some(*chunk_h) {
+                        continue;
+                    }
+                    prev_chunk = Some(*chunk_h);
                     let _ = live_table.insert(chunk_h, &());
-                    let _ = live_xorbs_table.insert(xorb_h, &());
                     if primary_table.get(chunk_h).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Get failed: {e}")))?.is_none() {
                         let _ = primary_table.insert(chunk_h, xorb_h);
                     }
@@ -878,55 +975,96 @@ impl ShardIndex {
             let xorb_table = read_txn.open_table(GC_XORB_CHUNKS_TABLE)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table open failed: {e}")))?;
 
-            // Resolve reconstructions concurrently. `buffered` (not `buffer_unordered`) keeps
-            // input order, so the first-writer-wins GC_PRIMARY_XORB_TABLE gets the same
-            // result as the old sequential loop.
+            // Each lookup scans the shards synchronously, so it is spawned onto the runtime's
+            // worker threads to run in parallel. Results are consumed in input order
+            // (`buffered`, not `buffer_unordered`), so the first-writer-wins
+            // GC_PRIMARY_XORB_TABLE gets the same result as the old sequential loop.
+            // Groups bound how many results are held in memory at once.
             let parsed: Vec<(&String, MerkleHash)> = live_file_hashes.iter()
                 .filter_map(|hex| MerkleHash::from_hex(hex).ok().map(|h| (hex, h)))
                 .collect();
-            let sfm = self.sfm.clone();
-            let lookups = _py.allow_threads(|| {
-                self.rt.block_on(async {
-                    futures::stream::iter(parsed.iter().map(|(_, h)| {
-                        let sfm = sfm.clone();
-                        let h = *h;
-                        async move { sfm.get_file_reconstruction_info(&h).await }
-                    }))
-                    .buffered(LIVENESS_LOOKUP_CONCURRENCY)
-                    .collect::<Vec<_>>()
-                    .await
-                })
+            // Use the file-to-shard map only if the registered shards are still the ones it was
+            // built from; otherwise every file takes the full lookup.
+            let file_map = self.gc_file_shards.read().unwrap().clone().filter(|m| {
+                let current: std::collections::HashSet<[u8; 32]> = _py
+                    .allow_threads(|| self.rt.block_on(self.sfm.registered_shard_list()))
+                    .map(|v| v.iter().map(|s| <[u8; 32]>::from(s.shard_hash)).collect())
+                    .unwrap_or_default();
+                let unchanged = current == m.shard_hashes;
+                if !unchanged {
+                    eprintln!("[GC Liveness] Registered shards changed since init_gc; using the full lookup.");
+                }
+                unchanged
             });
 
-            for ((file_hash_hex, _), res) in parsed.iter().zip(lookups) {
-                let res = res.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed for {}: {:?}", file_hash_hex, e)))?;
+            for group in parsed.chunks(LIVENESS_LOOKUP_GROUP) {
+                let lookups = _py.allow_threads(|| {
+                    self.rt.block_on(async {
+                        futures::stream::iter(group.iter().map(|(_, h)| {
+                            let index = self.sfm.clone();
+                            let h = *h;
+                            let h_bytes: [u8; 32] = h.into();
+                            // None: full lookup. Some(None): in no shard. Some(Some(s)): read s.
+                            let direct: Option<Option<Arc<mdb_shard::metadata_shard::MDBShardFile>>> = file_map.as_ref().and_then(|m| {
+                                match m.files.get(&h_bytes) {
+                                    None => Some(None),
+                                    Some(GcFileLoc::Uniform(shard)) => Some(Some(shard.clone())),
+                                    Some(GcFileLoc::Conflicting) => None,
+                                }
+                            });
+                            self.rt.spawn(async move {
+                                match direct {
+                                    Some(None) => return Ok(None),
+                                    Some(Some(shard)) => {
+                                        // Same segments as the entry the shard manager would
+                                        // return. On any surprise, fall back to its lookup.
+                                        if let Ok(Some(fi)) = shard.get_file_reconstruction_info(&h) {
+                                            return Ok(Some((fi, Some(shard.shard_hash))));
+                                        }
+                                    },
+                                    None => {},
+                                }
+                                index.get_file_reconstruction_info(&h).await
+                            })
+                        }))
+                        .buffered(LIVENESS_LOOKUP_CONCURRENCY)
+                        .collect::<Vec<_>>()
+                        .await
+                    })
+                });
 
-                let (file_info, _) = match res {
-                    Some(r) => r,
-                    None => continue,
-                };
+                for ((file_hash_hex, _), res) in group.iter().zip(lookups) {
+                    let res = res
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lookup task failed for {}: {:?}", file_hash_hex, e)))?
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Query failed for {}: {:?}", file_hash_hex, e)))?;
 
-                for segment in &file_info.segments {
-                    let xorb_h_bytes: [u8; 32] = segment.xorb_hash.into();
-                    xorbs_to_insert.push(xorb_h_bytes);
-                    if let Ok(Some(xorb_val)) = xorb_table.get(&xorb_h_bytes) {
-                        let bytes = xorb_val.value();
-                        let total_entries = bytes.len() / 40;
-                        let start_idx = (segment.chunk_index_start as usize).min(total_entries);
-                        let end_idx = (segment.chunk_index_end as usize).min(total_entries);
+                    let (file_info, _) = match res {
+                        Some(r) => r,
+                        None => continue,
+                    };
 
-                        for idx in start_idx..end_idx {
-                            let offset = idx * 40;
-                            let mut chunk_h = [0u8; 32];
-                            chunk_h.copy_from_slice(&bytes[offset..offset + 32]);
-                            chunks_to_insert.push((chunk_h, xorb_h_bytes));
+                    for segment in &file_info.segments {
+                        let xorb_h_bytes: [u8; 32] = segment.xorb_hash.into();
+                        xorbs_to_insert.push(xorb_h_bytes);
+                        if let Ok(Some(xorb_val)) = xorb_table.get(&xorb_h_bytes) {
+                            let bytes = xorb_val.value();
+                            let total_entries = bytes.len() / 40;
+                            let start_idx = (segment.chunk_index_start as usize).min(total_entries);
+                            let end_idx = (segment.chunk_index_end as usize).min(total_entries);
+
+                            for idx in start_idx..end_idx {
+                                let offset = idx * 40;
+                                let mut chunk_h = [0u8; 32];
+                                chunk_h.copy_from_slice(&bytes[offset..offset + 32]);
+                                chunks_to_insert.push((chunk_h, xorb_h_bytes));
                             
-                            if chunks_to_insert.len() >= 10000 {
-                                flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
+                                if chunks_to_insert.len() >= LIVENESS_FLUSH_CHUNKS {
+                                    flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
+                                }
                             }
+                        } else if xorbs_to_insert.len() >= 1000 {
+                            flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
                         }
-                    } else if xorbs_to_insert.len() >= 1000 {
-                        flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
                     }
                 }
             }
@@ -934,12 +1072,6 @@ impl ShardIndex {
 
         // Flush any remaining chunks
         flush_chunks(&mut chunks_to_insert, &mut xorbs_to_insert)?;
-
-        // Persist all Durability::None commits above with a single fsync.
-        let write_txn = gc_db.begin_write()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write txn failed: {e}")))?;
-        write_txn.commit()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit failed: {e}")))?;
 
         Ok(())
     }
@@ -1023,6 +1155,32 @@ impl ShardIndex {
             self.rt.block_on(verify::verify_shard(&self.sfm, &shard_bytes, chunks))
         });
         Ok(result.err())
+    }
+
+    /// Read-only deep audit of every registered shard (see `verify::deep_audit_shards`).
+    /// `live_file_hashes`: hex hashes of the files in use. Returns a dict of counts and lists.
+    #[pyo3(signature = (live_file_hashes))]
+    pub fn deep_audit(&self, py: Python<'_>, live_file_hashes: Vec<String>) -> PyResult<Py<PyDict>> {
+        let live: std::collections::HashSet<MerkleHash> = live_file_hashes.iter()
+            .filter_map(|h| MerkleHash::from_hex(h).ok())
+            .collect();
+        let (client, bucket) = crate::s3_client::create_s3_client()?;
+        let report = py.allow_threads(|| {
+            self.rt.block_on(async {
+                let shards = self.sfm.registered_shard_list().await.map_err(|e| format!("Failed to get shard list: {e:?}"))?;
+                let list: Vec<(String, std::path::PathBuf)> = shards.iter().map(|s| (s.shard_hash.hex(), s.path.clone())).collect();
+                verify::deep_audit_shards(&client, &bucket, &list, &live).await
+            })
+        }).map_err(PyErr::new::<pyo3::exceptions::PyIOError, _>)?;
+        let dict = PyDict::new(py);
+        dict.set_item("shards_checked", report.shards_checked)?;
+        dict.set_item("entries_checked", report.entries_checked)?;
+        dict.set_item("bad_entries", report.bad_entries)?;  // (file hash, reason, shard hash)
+        dict.set_item("blocks_checked", report.blocks_checked)?;
+        dict.set_item("blocks_wrong_chunks", report.blocks_wrong_chunks)?;
+        dict.set_item("blocks_old_positions", report.blocks_old_positions)?;
+        dict.set_item("blocks_xorb_missing", report.blocks_xorb_missing)?;
+        Ok(dict.into())
     }
 
     #[pyo3(signature = (sparse_threshold=30.0))]

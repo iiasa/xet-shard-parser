@@ -12,6 +12,7 @@ use crate::s3_client::{
     s3_check_exists,
     s3_put_object,
     s3_copy_object,
+    s3_copy_object_verified,
     s3_delete_object,
     s3_list_objects_v2,
     s3_upload_file_reqwest_http1,
@@ -41,8 +42,13 @@ pub const TXN_OLD_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new(
 pub const TXN_OLD_SHARDS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_old_shards");
 pub const TXN_NEW_XORBS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("txn_new_xorbs");
 pub const TXN_NEW_SHARDS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_new_shards");
-pub const TXN_CHUNK_MAP_TABLE: TableDefinition<&[u8; 32], &[u8; 36]> = TableDefinition::new("txn_chunk_map");
-pub const TXN_XORB_LAYOUT_TABLE: TableDefinition<&[u8; 36], &[u8; 32]> = TableDefinition::new("txn_xorb_layout");
+/// Where each repacked chunk went: (old xorb hash, old chunk index) -> (new xorb hash, new chunk index).
+/// Keyed by position, not chunk hash, so the same chunk repacked from two xorbs keeps both positions.
+pub const TXN_CHUNK_MAP_TABLE: TableDefinition<&[u8; 36], &[u8; 36]> = TableDefinition::new("txn_chunk_position_map");
+/// File entries in the new shards that failed the layout check: file hash (hex) -> reason.
+pub const TXN_BAD_FILE_ENTRIES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("txn_bad_file_entries");
+/// xet-core's per-xorb chunk limit (MAX_XORB_CHUNKS); repacked xorbs stay within it.
+const MAX_NEW_XORB_CHUNKS: usize = 8 * 1024;
 pub const TXN_MISSING_FILES_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_missing_files");
 pub const TXN_MISSING_POST_FILES_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_missing_post_files");
 pub const TXN_UNIQUE_XORBS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("txn_unique_xorbs");
@@ -71,56 +77,54 @@ fn value_err(e: impl std::fmt::Display) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
 }
 
+/// Lists every object under `prefix`, page by page, calling `f` for each one.
+async fn for_each_listed_object(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    mut f: impl FnMut(&aws_sdk_s3::types::Object),
+) -> Result<(), String> {
+    let mut token: Option<String> = None;
+    loop {
+        let resp = s3_list_objects_v2(client, bucket, prefix, token.as_deref(), MAX_S3_ATTEMPTS).await?;
+        for obj in resp.contents() {
+            f(obj);
+        }
+        token = resp.next_continuation_token().map(String::from);
+        if token.is_none() {
+            return Ok(());
+        }
+    }
+}
+
 /// Lists every object under `prefix` and returns the key suffixes (the xorb hashes).
 /// One LIST request covers 1000 keys, so this replaces a HEAD per xorb for the
 /// common case where the xorb exists. Callers still HEAD anything not listed.
 fn list_key_suffixes(rt: &Runtime, client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> PyResult<HashSet<String>> {
-    rt.block_on(async {
-        let mut keys = HashSet::new();
-        let mut token: Option<String> = None;
-        loop {
-            let resp = s3_list_objects_v2(client, bucket, prefix, token.as_deref(), MAX_S3_ATTEMPTS).await?;
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    if let Some(suffix) = key.strip_prefix(prefix) {
-                        keys.insert(suffix.to_string());
-                    }
-                }
-            }
-            token = resp.next_continuation_token().map(String::from);
-            if token.is_none() {
-                break;
-            }
+    let mut keys = HashSet::new();
+    rt.block_on(for_each_listed_object(client, bucket, prefix, |obj| {
+        if let Some(suffix) = obj.key().and_then(|key| key.strip_prefix(prefix)) {
+            keys.insert(suffix.to_string());
         }
-        Ok::<_, String>(keys)
-    }).map_err(io_err)
+    })).map_err(io_err)?;
+    Ok(keys)
 }
 
 /// Lists `xorbs/default/` page by page and returns the xorbs whose LastModified is at or after `cutoff_unix`.
 pub fn _list_young_xorbs(cutoff_unix: u64) -> PyResult<HashSet<[u8; 32]>> {
     let rt = Runtime::new().unwrap();
     let (client, bucket) = create_s3_client()?;
-    rt.block_on(async {
-        let mut young = HashSet::new();
-        let mut token: Option<String> = None;
-        loop {
-            let resp = s3_list_objects_v2(&client, &bucket, "xorbs/default/", token.as_deref(), MAX_S3_ATTEMPTS).await?;
-            for obj in resp.contents() {
-                let (Some(key), Some(modified)) = (obj.key(), obj.last_modified()) else { continue };
-                if modified.secs() < 0 || (modified.secs() as u64) < cutoff_unix {
-                    continue;
-                }
-                if let Ok(h) = MerkleHash::from_hex(key.rsplit('/').next().unwrap_or("")) {
-                    young.insert(h.into());
-                }
-            }
-            token = resp.next_continuation_token().map(String::from);
-            if token.is_none() {
-                break;
-            }
+    let mut young = HashSet::new();
+    rt.block_on(for_each_listed_object(&client, &bucket, "xorbs/default/", |obj| {
+        let (Some(key), Some(modified)) = (obj.key(), obj.last_modified()) else { return };
+        if modified.secs() < 0 || (modified.secs() as u64) < cutoff_unix {
+            return;
         }
-        Ok::<_, String>(young)
-    }).map_err(io_err)
+        if let Ok(h) = MerkleHash::from_hex(key.rsplit('/').next().unwrap_or("")) {
+            young.insert(h.into());
+        }
+    })).map_err(io_err)?;
+    Ok(young)
 }
 
 /// Removes xorbs last written at or after `cutoff_unix` from the GC's sparse set, so start
@@ -229,8 +233,9 @@ async fn s3_move_object(client: &aws_sdk_s3::Client, bucket: &str, src_key: &str
 
 /// Runs `f` on every item with up to MAX_CONCURRENCY in flight. Stops starting new items
 /// after the first error (items already running finish) and returns that error.
-async fn for_each_concurrent<T, F, Fut>(items: Vec<T>, f: F) -> Result<(), String>
+async fn for_each_concurrent<I, T, F, Fut>(items: I, f: F) -> Result<(), String>
 where
+    I: IntoIterator<Item = T>,
     F: Fn(T) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
@@ -238,6 +243,45 @@ where
     iter(items.into_iter().map(Ok::<T, String>))
         .try_for_each_concurrent(MAX_CONCURRENCY, f)
         .await
+}
+
+/// Finds where a segment of an old xorb (chunks `start..end`) went during repacking. Returns the
+/// new xorb and start index only if every chunk moved, in order, to consecutive positions of
+/// the same new xorb.
+/// Rewrites a CAS info block's chunk positions as cumulative unpacked bytes, the way xet-core
+/// writes them. Blocks from uploads are unchanged; blocks written by earlier GC runs (which used
+/// packed positions) are corrected when GC copies them into a new shard.
+fn with_unpacked_positions(mut info: MDBXorbInfo) -> MDBXorbInfo {
+    let mut pos: u32 = 0;
+    for c in &mut info.chunks {
+        c.chunk_byte_range_start = pos;
+        pos = pos.saturating_add(c.unpacked_segment_bytes);
+    }
+    info.metadata.num_bytes_in_xorb = pos;
+    info
+}
+
+fn remap_segment(
+    chunk_map: &impl ReadableTable<&'static [u8; 36], &'static [u8; 36]>,
+    old_xorb: &[u8; 32],
+    start: u32,
+    end: u32,
+) -> Option<(MerkleHash, u32)> {
+    let new_pos = |idx: u32| -> Option<([u8; 32], u32)> {
+        let mut key = [0u8; 36];
+        key[0..32].copy_from_slice(old_xorb);
+        key[32..36].copy_from_slice(&idx.to_le_bytes());
+        let val = chunk_map.get(&key).ok()??;
+        let v = val.value();
+        Some((<[u8; 32]>::try_from(&v[0..32]).ok()?, u32::from_le_bytes(v[32..36].try_into().ok()?)))
+    };
+    let (new_xorb, new_start) = new_pos(start)?;
+    for k in 1..end.saturating_sub(start) {
+        if new_pos(start + k)? != (new_xorb, new_start + k) {
+            return None;
+        }
+    }
+    Some((MerkleHash::from(new_xorb), new_start))
 }
 
 /// Files looked up per batch in the GC verify scans.
@@ -261,11 +305,18 @@ fn get_current_rss_mb() -> f64 {
 
 use mdb_shard::metadata_shard::{ChunkIndexSizeEnforcement, ShardFileManager};
 
+/// `drop_entries`: (file hash, shard hash hex) of file entries to leave out, for example the
+/// wrong entries `audit --deep` found. Their shards are rewritten even if nothing else in them
+/// changes.
 pub fn _consolidate_metadata(
     sfm: Arc<ShardFileManager>,
     gc_db: Arc<std::sync::RwLock<Option<Database>>>,
     started_at: u64,
+    drop_entries: &HashSet<([u8; 32], String)>,
 ) -> PyResult<()> {
+    let drop_shards: HashSet<&String> = drop_entries.iter().map(|(_, s)| s).collect();
+    let mut dropped_entries = 0usize;
+    let mut dropped_live_entries = 0usize;
     
     let gc_db_lock = gc_db.read().unwrap();
     let db = match &*gc_db_lock {
@@ -289,9 +340,11 @@ pub fn _consolidate_metadata(
     // Buffer State
     let mut xorb_new_chunks: Vec<u8> = Vec::new();
     let mut new_entries: Vec<XorbChunkSequenceEntry> = Vec::new();
-    let mut current_offset: u32 = 0;
-    let mut current_xorb_chunk_hashes: Vec<MerkleHash> = Vec::new();
+    // (old xorb, old index) of each chunk in the buffer, in buffer order.
+    let mut current_old_positions: Vec<[u8; 36]> = Vec::new();
     let mut current_uncompressed_size: u32 = 0;
+    // New xorbs that turned out identical to a xorb already in xorbs/default/ (see flush_xorb_buffer).
+    let mut reused_xorbs: std::collections::HashMap<MerkleHash, MDBXorbInfo> = std::collections::HashMap::new();
 
     // 1. Transaction Lock Database (opened at start to stream incrementally)
     let txn_path = "/tmp/active_transaction.redb";
@@ -310,33 +363,47 @@ pub fn _consolidate_metadata(
     let mut old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
     let mut new_shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
     let mut chunk_map_table = write_txn.open_table(TXN_CHUNK_MAP_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
-    let mut layout_table = write_txn.open_table(TXN_XORB_LAYOUT_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
 
     let sparse_xorbs = read_txn.open_table(GC_SPARSE_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table error: {e}")))?;
 
     // A closure to flush the current buffer to S3
-    let flush_xorb_buffer = |chunks: &mut Vec<u8>, entries: &mut Vec<XorbChunkSequenceEntry>, hashes: &mut Vec<MerkleHash>, offset: &mut u32, unp_size: &mut u32, map_table: &mut redb::Table<&[u8; 32], &[u8; 36]>, xorbs_table: &mut redb::Table<&str, &[u8]>| -> PyResult<()> {
+    let flush_xorb_buffer = |chunks: &mut Vec<u8>, entries: &mut Vec<XorbChunkSequenceEntry>, old_positions: &mut Vec<[u8; 36]>, unp_size: &mut u32, map_table: &mut redb::Table<&[u8; 36], &[u8; 36]>, xorbs_table: &mut redb::Table<&str, &[u8]>, reused: &mut std::collections::HashMap<MerkleHash, MDBXorbInfo>| -> PyResult<()> {
         if chunks.is_empty() { return Ok(()); }
         
         let mut xorb_new_full = Vec::new();
-        reconstruct_xorb_with_footer(&mut xorb_new_full, chunks)
+        // xet-core hashes every chunk from the data and returns the standard xorb hash (the one
+        // it also writes into the footer); the new xorb is named by it, like uploaded xorbs.
+        let (_, new_xorb_hash) = reconstruct_xorb_with_footer(&mut xorb_new_full, chunks)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Footer error: {e:?}")))?;
-            
-        let new_xorb_hash = compute_data_hash(&xorb_new_full);
         let new_xorb_hash_str = new_xorb_hash.hex();
         
-        for (i, h) in hashes.iter().enumerate() {
+        for (i, old_pos) in old_positions.iter().enumerate() {
             let mut val = [0u8; 36];
             val[0..32].copy_from_slice(new_xorb_hash.as_bytes());
             val[32..36].copy_from_slice(&(i as u32).to_le_bytes());
-            let h_bytes: [u8; 32] = (*h).into();
-            map_table.insert(&h_bytes, &val).unwrap();
+            map_table.insert(old_pos, &val).unwrap();
         }
 
         let xorb_info = MDBXorbInfo {
-            metadata: XorbChunkSequenceHeader::new(new_xorb_hash, entries.len() as u32, *offset),
+            metadata: XorbChunkSequenceHeader::new(new_xorb_hash, entries.len() as u32, *unp_size),
             chunks: entries.clone(),
         };
+
+        // The standard name depends only on the chunks, so a new xorb can come out identical to a
+        // xorb that already exists (for example one repacked without dropping any chunk). Then
+        // that xorb is reused as is: nothing is uploaded, and it is kept off the delete list below.
+        let existing_key = format!("xorbs/default/{new_xorb_hash_str}");
+        let new_xorb_key: [u8; 32] = new_xorb_hash.into();
+        let known = xorb_chunks.get(&new_xorb_key).ok().flatten().is_some();
+        if known && rt.block_on(s3_check_exists(&client, &bucket, &existing_key, MAX_S3_ATTEMPTS)).map_err(io_err)? {
+            reused.insert(new_xorb_hash, xorb_info);
+            chunks.clear();
+            entries.clear();
+            old_positions.clear();
+            *unp_size = 0;
+            return Ok(());
+        }
+
         let mut serialized_bytes = Vec::new();
         xorb_info.serialize(&mut serialized_bytes)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
@@ -353,8 +420,7 @@ pub fn _consolidate_metadata(
         // Reset buffer
         chunks.clear();
         entries.clear();
-        hashes.clear();
-        *offset = 0;
+        old_positions.clear();
         *unp_size = 0;
         Ok(())
     };
@@ -426,6 +492,8 @@ pub fn _consolidate_metadata(
         struct RangeReq {
             start: usize,
             end: usize,
+            /// (old xorb, old index) of each chunk.
+            old_positions: Vec<[u8; 36]>,
             hashes: Vec<MerkleHash>,
             unp_lens: Vec<u32>,
             chunk_lens: Vec<usize>,
@@ -455,7 +523,6 @@ pub fn _consolidate_metadata(
                         let mut layout_key = [0u8; 36];
                         layout_key[0..32].copy_from_slice(&hash_bytes);
                         layout_key[32..36].copy_from_slice(&(i as u32).to_le_bytes());
-                        layout_table.insert(&layout_key, &h_bytes).unwrap();
                         
                         let is_live = live_chunks.get(&h_bytes).unwrap().is_some();
                         if is_live {
@@ -467,15 +534,16 @@ pub fn _consolidate_metadata(
                             if let Some(ref mut req) = current_range {
                                 if req.end == start { // contiguous
                                     req.end = end;
+                                    req.old_positions.push(layout_key);
                                     req.hashes.push(h);
                                     req.unp_lens.push(unp_len);
                                     req.chunk_lens.push(len);
                                 } else {
                                     ranges.push(current_range.take().unwrap());
-                                    current_range = Some(RangeReq { start, end, hashes: vec![h], unp_lens: vec![unp_len], chunk_lens: vec![len] });
+                                    current_range = Some(RangeReq { start, end, old_positions: vec![layout_key], hashes: vec![h], unp_lens: vec![unp_len], chunk_lens: vec![len] });
                                 }
                             } else {
-                                current_range = Some(RangeReq { start, end, hashes: vec![h], unp_lens: vec![unp_len], chunk_lens: vec![len] });
+                                current_range = Some(RangeReq { start, end, old_positions: vec![layout_key], hashes: vec![h], unp_lens: vec![unp_len], chunk_lens: vec![len] });
                             }
                         }
                     }
@@ -513,47 +581,73 @@ pub fn _consolidate_metadata(
         });
         
         // 2d. Process Fetched Ranges
+        // A range is a run of consecutive live chunks of one old xorb, so every file segment that
+        // pointed into it lies inside one range. Ranges are never split across new xorbs: that
+        // keeps each segment contiguous in a single new xorb, which the shard rewrite relies on.
         for (req, bytes_result) in fetched_ranges {
-            let bytes_opt = bytes_result.map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
-            if let Some(bytes) = bytes_opt {
-                let mut offset = 0;
-                for j in 0..req.hashes.len() {
-                    let h = req.hashes[j];
-                    let unp_len = req.unp_lens[j];
-                    let len = req.chunk_lens[j];
-                    
-                    if offset + len <= bytes.len() {
-                        xorb_new_chunks.extend_from_slice(&bytes[offset..offset+len]);
-                        current_xorb_chunk_hashes.push(h);
-                        new_entries.push(XorbChunkSequenceEntry::new(h, unp_len, current_offset));
-                        current_offset += len as u32;
-                        current_uncompressed_size += unp_len;
-                        offset += len;
-                        
-                        if current_uncompressed_size >= max_xorb_size {
-                            flush_xorb_buffer(&mut xorb_new_chunks, &mut new_entries, &mut current_xorb_chunk_hashes, &mut current_offset, &mut current_uncompressed_size, &mut chunk_map_table, &mut new_xorbs_table)?;
-                        }
-                    }
-                }
+            let bytes = bytes_result.map_err(io_err)?
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyIOError, _>("Range download returned no data"))?;
+            if bytes.len() != req.end - req.start {
+                return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Range download returned {} bytes, expected {}", bytes.len(), req.end - req.start)));
+            }
+
+            let range_unpacked: u64 = req.unp_lens.iter().map(|l| *l as u64).sum();
+            let would_overflow = current_uncompressed_size as u64 + range_unpacked > max_xorb_size as u64
+                || current_old_positions.len() + req.hashes.len() > MAX_NEW_XORB_CHUNKS;
+            if !current_old_positions.is_empty() && would_overflow {
+                flush_xorb_buffer(&mut xorb_new_chunks, &mut new_entries, &mut current_old_positions, &mut current_uncompressed_size, &mut chunk_map_table, &mut new_xorbs_table, &mut reused_xorbs)?;
+            }
+
+            let mut offset = 0;
+            for j in 0..req.hashes.len() {
+                let len = req.chunk_lens[j];
+                xorb_new_chunks.extend_from_slice(&bytes[offset..offset + len]);
+                current_old_positions.push(req.old_positions[j]);
+                // Chunk positions in CAS info are cumulative unpacked bytes, as xet-core writes them.
+                new_entries.push(XorbChunkSequenceEntry::new(req.hashes[j], req.unp_lens[j], current_uncompressed_size));
+                current_uncompressed_size += req.unp_lens[j];
+                offset += len;
+            }
+
+            if current_uncompressed_size >= max_xorb_size || current_old_positions.len() >= MAX_NEW_XORB_CHUNKS {
+                flush_xorb_buffer(&mut xorb_new_chunks, &mut new_entries, &mut current_old_positions, &mut current_uncompressed_size, &mut chunk_map_table, &mut new_xorbs_table, &mut reused_xorbs)?;
             }
         }
     }
     
     // Flush any remaining partial XORB
-    flush_xorb_buffer(&mut xorb_new_chunks, &mut new_entries, &mut current_xorb_chunk_hashes, &mut current_offset, &mut current_uncompressed_size, &mut chunk_map_table, &mut new_xorbs_table)?;
+    flush_xorb_buffer(&mut xorb_new_chunks, &mut new_entries, &mut current_old_positions, &mut current_uncompressed_size, &mut chunk_map_table, &mut new_xorbs_table, &mut reused_xorbs)?;
 
     // 3. Process Old Shards Incrementally and Stream into New Shards
     let mut current_shard = MDBInMemoryShard::default();
     let mut added_xorbs: HashSet<MerkleHash> = HashSet::new();
     let max_shard_size: u64 = 64 * 1024 * 1024; // 64 MB target
     let mut unwritten_files = 0;
+    // Keys under xorbs/default/, listed once on first need (see "still in use" below).
+    let mut stored_xorbs: Option<HashSet<String>> = None;
+    let mut blocks_kept_without_files = 0usize;
 
-    let flush_shard = |shard_mem: &mut MDBInMemoryShard, new_shards_table: &mut redb::Table<&str, ()>, added_xorbs: &mut HashSet<MerkleHash>| -> PyResult<()> {
+    // Shards are named by the hash of their bytes, so a rewrite that changes nothing comes out
+    // with the name of the shard it replaces (for example a shard an earlier, reverted GC run
+    // wrote). Uploading it as "new" and moving the "old" one to bin/ would remove that one object
+    // from shards/. Such a shard is kept as it is instead (see the end of this function).
+    let registered_shards: HashSet<String> = rt.block_on(sfm.registered_shard_list())
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?
+        .iter().map(|s| s.shard_hash.hex()).collect();
+    let mut unchanged_shards: HashSet<String> = HashSet::new();
+    let flush_shard = |shard_mem: &mut MDBInMemoryShard, new_shards_table: &mut redb::Table<&str, ()>, added_xorbs: &mut HashSet<MerkleHash>, unchanged: &mut HashSet<String>| -> PyResult<()> {
         let shard_bytes = shard_mem.to_bytes()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Serialize error: {e:?}")))?;
         
         let new_shard_hash = compute_data_hash(&shard_bytes);
         let new_shard_hash_str = new_shard_hash.hex();
+        if registered_shards.contains(&new_shard_hash_str) {
+            unchanged.insert(new_shard_hash_str);
+            *shard_mem = MDBInMemoryShard::default();
+            added_xorbs.clear();
+            return Ok(());
+        }
         
         rt.block_on(async {
             let key = format!("gc_consolidated/shards/{}.mdb", new_shard_hash_str);
@@ -617,6 +711,9 @@ pub fn _consolidate_metadata(
                 }
             }
             
+            if drop_shards.contains(&shard_hash_str) {
+                has_sparse = true;
+            }
             if !has_sparse {
                 continue;
             }
@@ -634,7 +731,7 @@ pub fn _consolidate_metadata(
                         let x_hash_str = x_hash.hex();
                         old_xorbs_table.insert(x_hash_str.as_str(), ()).unwrap();
                     } else if live_xorbs.get(&x_bytes).unwrap().is_some() {
-                        existing_xorb_blocks.insert(x_hash, MDBXorbInfo::from(xorb_view));
+                        existing_xorb_blocks.insert(x_hash, with_unpacked_positions(MDBXorbInfo::from(xorb_view)));
                     }
                 }
             }
@@ -642,7 +739,17 @@ pub fn _consolidate_metadata(
             for i in 0..minimal_shard.num_files() {
                 if let Some(file_view) = minimal_shard.file(i) {
                     let fh_bytes: [u8; 32] = file_view.file_hash().into();
-                    if live_files.get(&fh_bytes).unwrap().is_some() {
+                    let is_live = live_files.get(&fh_bytes).unwrap().is_some();
+                    if !drop_shards.is_empty() && drop_entries.contains(&(fh_bytes, shard_hash_str.clone())) {
+                        dropped_entries += 1;
+                        if is_live {
+                            // Still in use: verification reports the file if no other entry is left.
+                            dropped_live_entries += 1;
+                            eprintln!("[GC] Dropping entry of file {} in shard {shard_hash_str}, but the file is still in use.", file_view.file_hash().hex());
+                        }
+                        continue;
+                    }
+                    if is_live {
                         let mut file_info = MDBFileInfo::from(file_view);
                         let mut valid = true;
                         
@@ -650,29 +757,20 @@ pub fn _consolidate_metadata(
                             let seg_hash_bytes: [u8; 32] = seg.xorb_hash.into();
                             let is_sparse = sparse_xorbs.get(&seg_hash_bytes).unwrap().is_some();
                             if is_sparse {
-                                let mut layout_key = [0u8; 36];
-                                layout_key[0..32].copy_from_slice(&seg_hash_bytes);
-                                layout_key[32..36].copy_from_slice(&seg.chunk_index_start.to_le_bytes());
-                                
-                                if let Some(chunk_hash_val) = layout_table.get(&layout_key).unwrap() {
-                                    let first_chunk_bytes: [u8; 32] = *chunk_hash_val.value();
-                                    
-                                    if let Some(chunk_val) = chunk_map_table.get(&first_chunk_bytes).unwrap() {
-                                        let val = chunk_val.value();
-                                        let new_xorb_hash = MerkleHash::from(<[u8; 32]>::try_from(&val[0..32]).unwrap());
-                                        let new_start_idx = u32::from_le_bytes(val[32..36].try_into().unwrap());
-                                        
-                                        seg.xorb_hash = new_xorb_hash;
+                                // Every chunk of the segment must have moved to consecutive
+                                // positions of one new xorb; otherwise the entry can't be remapped
+                                // (it is left out and verification reports the file).
+                                match remap_segment(&chunk_map_table, &seg_hash_bytes, seg.chunk_index_start, seg.chunk_index_end) {
+                                    Some((new_xorb_hash, new_start_idx)) => {
                                         let length = seg.chunk_index_end - seg.chunk_index_start;
+                                        seg.xorb_hash = new_xorb_hash;
                                         seg.chunk_index_start = new_start_idx;
                                         seg.chunk_index_end = new_start_idx + length;
-                                    } else {
+                                    },
+                                    None => {
                                         valid = false;
                                         break;
-                                    }
-                                } else {
-                                    valid = false;
-                                    break;
+                                    },
                                 }
                             } else if live_xorbs.get(&seg_hash_bytes).unwrap().is_none() {
                                 valid = false;
@@ -683,7 +781,11 @@ pub fn _consolidate_metadata(
                             for seg in &file_info.segments {
                                 if !added_xorbs.contains(&seg.xorb_hash) {
                                     let x_str = seg.xorb_hash.hex();
-                                    if let Some(xorb_val) = new_xorbs_table.get(x_str.as_str()).unwrap() {
+                                    if let Some(xorb_info) = reused_xorbs.get(&seg.xorb_hash) {
+                                        current_shard.add_xorb_block(xorb_info.clone())
+                                            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
+                                        added_xorbs.insert(seg.xorb_hash);
+                                    } else if let Some(xorb_val) = new_xorbs_table.get(x_str.as_str()).unwrap() {
                                         let bytes = xorb_val.value();
                                         if let Ok(Some(xorb_info)) = MDBXorbInfo::deserialize(&mut std::io::Cursor::new(bytes)) {
                                             current_shard.add_xorb_block(xorb_info)
@@ -705,10 +807,9 @@ pub fn _consolidate_metadata(
                                                 let base = idx * 40;
                                                 let mut ch_bytes = [0u8; 32];
                                                 ch_bytes.copy_from_slice(&bytes[base..base + 32]);
-                                                let packed_len = u32::from_le_bytes(bytes[base + 32..base + 36].try_into().unwrap());
                                                 let unp_len = u32::from_le_bytes(bytes[base + 36..base + 40].try_into().unwrap());
                                                 entries.push(XorbChunkSequenceEntry::new(MerkleHash::from(ch_bytes), unp_len, offset_acc));
-                                                offset_acc = offset_acc.saturating_add(packed_len);
+                                                offset_acc = offset_acc.saturating_add(unp_len);
                                             }
                                             let xorb_info = MDBXorbInfo {
                                                 metadata: XorbChunkSequenceHeader::new(seg.xorb_hash, entries.len() as u32, offset_acc),
@@ -727,20 +828,66 @@ pub fn _consolidate_metadata(
                             unwritten_files += 1;
                             
                             if current_shard.shard_file_size() >= max_shard_size {
-                                flush_shard(&mut current_shard, &mut new_shards_table, &mut added_xorbs)?;
+                                flush_shard(&mut current_shard, &mut new_shards_table, &mut added_xorbs, &mut unchanged_shards)?;
                                 unwritten_files = 0;
                             }
                         }
                     }
                 }
             }
+            // Keep the blocks of this shard's xorbs that stay in use even when none of the files
+            // written above uses them (their files are in other shards, or were deleted). Uploads
+            // only describe the xorbs they created, so this shard may be the only one with such a
+            // block; without it the dedup chunk lookup (/v1/chunks) could no longer find the xorb.
+            // Only xorbs that are really in S3: shards can list xorbs whose object is gone.
+            let mut still_used: Vec<(&MerkleHash, &MDBXorbInfo)> = existing_xorb_blocks.iter()
+                .filter(|(h, _)| !added_xorbs.contains(*h))
+                .collect();
+            if !still_used.is_empty() && stored_xorbs.is_none() {
+                stored_xorbs = Some(list_key_suffixes(&rt, &client, &bucket, "xorbs/default/")?);
+            }
+            if let Some(stored) = &stored_xorbs {
+                still_used.retain(|(h, _)| stored.contains(&h.hex()));
+            }
+            still_used.sort_by_key(|(h, _)| <[u8; 32]>::from(**h));
+            for (h, info) in still_used {
+                current_shard.add_xorb_block(info.clone())
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Shard error: {e:?}")))?;
+                added_xorbs.insert(*h);
+                blocks_kept_without_files += 1;
+            }
+            if current_shard.shard_file_size() >= max_shard_size {
+                flush_shard(&mut current_shard, &mut new_shards_table, &mut added_xorbs, &mut unchanged_shards)?;
+                unwritten_files = 0;
+            }
         }
     }
 
     if unwritten_files > 0 || current_shard.num_xorb_entries() > 0 {
-        flush_shard(&mut current_shard, &mut new_shards_table, &mut added_xorbs)?;
+        flush_shard(&mut current_shard, &mut new_shards_table, &mut added_xorbs, &mut unchanged_shards)?;
     }
+    eprintln!("[GC] Carried {blocks_kept_without_files} info blocks of xorbs still in use whose own rewritten shard has no file using them.");
     
+    if !drop_entries.is_empty() {
+        eprintln!("[GC] Dropped {dropped_entries} of {} requested file entries ({dropped_live_entries} of files still in use).", drop_entries.len());
+    }
+
+    // A rewrite identical to an existing shard: that shard stays in shards/ as it is.
+    for h in &unchanged_shards {
+        old_shards_table.remove(h.as_str()).map_err(io_err)?;
+    }
+    if !unchanged_shards.is_empty() {
+        eprintln!("[GC] {} rewritten shards are identical to existing shards; keeping those as they are.", unchanged_shards.len());
+    }
+
+    // A reused xorb holds live chunks again: it must never be deleted, even if it was sparse.
+    for h in reused_xorbs.keys() {
+        old_xorbs_table.remove(h.hex().as_str()).map_err(io_err)?;
+    }
+    if !reused_xorbs.is_empty() {
+        eprintln!("[GC] {} repacked xorbs are identical to existing xorbs; reusing those instead of uploading copies.", reused_xorbs.len());
+    }
+
     // 4. Update the active transaction metadata status to "consolidated"Lock
     drop(old_xorbs_table);
     drop(new_xorbs_table);
@@ -748,7 +895,6 @@ pub fn _consolidate_metadata(
     drop(new_shards_table);
     drop(chunk_map_table);
     drop(meta_table);
-    drop(layout_table);
     
     write_txn.commit().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Commit txn error: {e}")))?;
     drop(txn_db);
@@ -789,8 +935,19 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot stage: status is missing"));
         }
         let status_val = status.unwrap().value().to_string();
-        if status_val != "consolidated" && status_val != "verified" && status_val != "verification_failed" && status_val != "failed" {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("Cannot stage: status must be consolidated, verified, verification_failed, or failed"));
+        // Only a transaction whose verification found no problem at all is published: no file
+        // missing after GC (including files already broken before it, since GC drops entries
+        // that point at missing xorbs) and no wrong entry in the new shards.
+        if status_val != "verified" {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Cannot stage: status is '{status_val}', it must be 'verified'. Fix the reported problems and run GC start again, or revert.")));
+        }
+        // Never publish shards whose file entries point at the wrong chunks.
+        let bad_entries: usize = meta.get("bad_file_entries").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?
+            .and_then(|v| v.value().parse().ok()).unwrap_or(0);
+        if bad_entries > 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Cannot stage: verification found {bad_entries} file entries in the new shards that point at the wrong chunks. Run GC start again.")));
         }
         
         let new_xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
@@ -809,10 +966,9 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
             for_each_concurrent(new_xorbs, |hash| {
                 let (client, bucket) = (&client, &bucket);
                 async move {
-                    let src = format!("{}/gc_consolidated/xorbs/{}", bucket, hash);
+                    let src = format!("gc_consolidated/xorbs/{}", hash);
                     let dest = format!("xorbs/default/{}", hash);
-                    s3_copy_object(client, bucket, &src, &dest, MAX_S3_ATTEMPTS, false).await
-                        .map(|_| ())
+                    s3_copy_object_verified(client, bucket, &src, &dest, MAX_S3_ATTEMPTS).await
                         .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))
                 }
             }).await?;
@@ -822,9 +978,9 @@ pub fn _stage_gc_transaction() -> PyResult<()> {
             for_each_concurrent(new_shards, |hash| {
                 let (client, bucket) = (&client, &bucket);
                 async move {
-                    let src = format!("{}/gc_consolidated/shards/{}.mdb", bucket, hash);
+                    let src = format!("gc_consolidated/shards/{}.mdb", hash);
                     let dest = format!("shards/{}.mdb", hash);
-                    s3_copy_object(client, bucket, &src, &dest, MAX_S3_ATTEMPTS, false).await
+                    s3_copy_object_verified(client, bucket, &src, &dest, MAX_S3_ATTEMPTS).await
                         .map_err(|e| format!("Copy failed for {}: {:?}", hash, e))?;
 
                     // Delete any existing tombstone for this new shard (resurrection)
@@ -881,7 +1037,6 @@ fn _verify_pre_gc_transaction(
     write_txn: &redb::WriteTransaction,
     rt: &Runtime,
 ) -> PyResult<usize> {
-    let verify_sfm = sfm.clone();
     eprintln!("[GC Verify PRE] Phase 2: Scanning live files from GC_LIVE_FILES_TABLE... (Current RSS: {} MB)", get_current_rss_mb());
     let mut missing_count = 0;
     let mut files_scanned = 0;
@@ -893,7 +1048,7 @@ fn _verify_pre_gc_transaction(
     if let Some(ref gcdb) = *gc_db_lock {
         let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
         if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
-            // Look files up concurrently in batches; `buffered` keeps table order.
+            // Look files up in parallel in batches; `buffered` keeps table order.
             let mut file_iter = files_table.iter().unwrap();
             loop {
                 let chunk: Vec<[u8; 32]> = file_iter.by_ref().take(VERIFY_LOOKUP_BATCH).map(|item| {
@@ -909,9 +1064,12 @@ fn _verify_pre_gc_transaction(
                     futures::stream::StreamExt::collect::<Vec<_>>(
                         futures::stream::StreamExt::buffered(
                             futures::stream::iter(chunk.iter().map(|h| {
-                                let sfm = verify_sfm.clone();
+                                // Lookups scan shards synchronously: spawn them onto the
+                                // runtime's worker threads so they run in parallel.
+                                let index = sfm.clone();
                                 let mh = MerkleHash::from(*h);
-                                async move { sfm.get_file_reconstruction_info(&mh).await }
+                                let task = rt.spawn(async move { index.get_file_reconstruction_info(&mh).await });
+                                async move { task.await.expect("shard lookup task panicked") }
                             })),
                             MAX_CONCURRENCY,
                         )
@@ -1006,7 +1164,7 @@ fn _verify_pre_gc_transaction(
             process_batch(&mut batch)?;
             xorbs_scanned += 100;
             if xorbs_scanned % 1000 == 0 {
-                eprintln!("[GC Verify PRE] Phase 3: Verified {} XORBs (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
+                eprintln!("[GC Verify PRE] Phase 3: Checked {} unlisted XORBs individually (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
             }
         }
     }
@@ -1037,7 +1195,7 @@ fn _verify_pre_gc_transaction(
                     }
                     
                     let mut xorb_deps = Vec::new();
-                    let res = rt.block_on(async { verify_sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
+                    let res = rt.block_on(async { sfm.get_file_reconstruction_info(&MerkleHash::from_hex(&file_hash_hex).unwrap()).await });
                     if let Ok(Some((info, _))) = res {
                         for segment in info.segments {
                             xorb_deps.push(segment.xorb_hash.hex());
@@ -1138,7 +1296,7 @@ fn _verify_post_gc_transaction(
     if let Some(ref gcdb) = *gc_db_lock {
         let read_txn = gcdb.begin_read().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read txn error: {e}")))?;
         if let Ok(files_table) = read_txn.open_table(GC_LIVE_FILES_TABLE) {
-            // Look files up concurrently in batches; `buffered` keeps table order.
+            // Look files up in parallel in batches; `buffered` keeps table order.
             let mut file_iter = files_table.iter().unwrap();
             loop {
                 let chunk: Vec<[u8; 32]> = file_iter.by_ref().take(VERIFY_LOOKUP_BATCH).map(|item| {
@@ -1154,9 +1312,12 @@ fn _verify_post_gc_transaction(
                     futures::stream::StreamExt::collect::<Vec<_>>(
                         futures::stream::StreamExt::buffered(
                             futures::stream::iter(chunk.iter().map(|h| {
-                                let sfm = verify_sfm.clone();
+                                // Lookups scan shards synchronously: spawn them onto the
+                                // runtime's worker threads so they run in parallel.
+                                let index = verify_sfm.clone();
                                 let mh = MerkleHash::from(*h);
-                                async move { sfm.get_file_reconstruction_info(&mh).await }
+                                let task = rt.spawn(async move { index.get_file_reconstruction_info(&mh).await });
+                                async move { task.await.expect("shard lookup task panicked") }
                             })),
                             MAX_CONCURRENCY,
                         )
@@ -1261,7 +1422,7 @@ fn _verify_post_gc_transaction(
             process_batch(&mut batch)?;
             xorbs_scanned += 100;
             if xorbs_scanned % 1000 == 0 {
-                eprintln!("[GC Verify POST] Phase 3: Verified {} XORBs (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
+                eprintln!("[GC Verify POST] Phase 3: Checked {} unlisted XORBs individually (RSS: {} MB)", xorbs_scanned, get_current_rss_mb());
             }
         }
     }
@@ -1359,8 +1520,98 @@ pub fn _verify_gc_transaction(
     let missing_post_gc = _verify_post_gc_transaction(sfm.clone(), gc_db.clone(), &client, &bucket, &write_txn, &rt)?;
     eprintln!("[GC Verify] POST-GC Missing files: {}", missing_post_gc);
 
-    eprintln!("[GC Verify] Phase 5: Committing verification results (missing files post-gc: {})", missing_post_gc);
-    if missing_post_gc == 0 {
+    // Pass 3: every file entry in the new shards must describe its file correctly in the xorbs
+    // it points at. Passes 1-2 only check that those xorbs exist.
+    let (new_shards, new_xorbs) = {
+        let shards_table = write_txn.open_table(TXN_NEW_SHARDS_TABLE).map_err(io_err)?;
+        let xorbs_table = write_txn.open_table(TXN_NEW_XORBS_TABLE).map_err(io_err)?;
+        let shards: Vec<String> = shards_table.iter().map_err(io_err)?
+            .map(|item| item.map(|(k, _)| k.value().to_string())).collect::<Result<_, _>>().map_err(io_err)?;
+        let xorbs: HashSet<String> = xorbs_table.iter().map_err(io_err)?
+            .map(|item| item.map(|(k, _)| k.value().to_string())).collect::<Result<_, _>>().map_err(io_err)?;
+        (shards, xorbs)
+    };
+    let (old_shards, old_xorbs) = {
+        let shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(io_err)?;
+        let xorbs_table = write_txn.open_table(TXN_OLD_XORBS_TABLE).map_err(io_err)?;
+        let shards: HashSet<String> = shards_table.iter().map_err(io_err)?
+            .map(|item| item.map(|(k, _)| k.value().to_string())).collect::<Result<_, _>>().map_err(io_err)?;
+        let xorbs: HashSet<String> = xorbs_table.iter().map_err(io_err)?
+            .map(|item| item.map(|(k, _)| k.value().to_string())).collect::<Result<_, _>>().map_err(io_err)?;
+        (shards, xorbs)
+    };
+    let mut blocks_before: HashSet<String> = HashSet::new();
+    let mut blocks_after: HashSet<String> = HashSet::new();
+    let (entries_checked, mut bad_entries) = rt.block_on(crate::verify::check_gc_shard_entries(&client, &bucket, &new_shards, &new_xorbs, &old_xorbs, &mut blocks_after))
+        .map_err(io_err)?;
+    // Shards GC leaves in place must not point at xorbs commit deletes either. True by
+    // construction (any shard mentioning such a xorb is rewritten); checked here on the local
+    // shard files, every file entry, no network.
+    let untouched_checked = check_untouched_shards(&rt, &sfm, &old_shards, &old_xorbs, &mut bad_entries, &mut blocks_before, &mut blocks_after)?;
+    eprintln!("[GC Verify] Untouched shards: {untouched_checked} checked for entries pointing at xorbs that commit deletes");
+
+    // Every xorb that stays in use and had a CAS info block in a replaced shard must still have
+    // one after GC: without it, uploads can no longer reuse its chunks (wasted storage, not
+    // broken files). Xorbs deleted at commit, or missing from S3, are rightly left out.
+    {
+        let missing_xorbs: HashSet<String> = {
+            let t = write_txn.open_table(redb::TableDefinition::<&str, ()>::new("txn_missing_post_xorbs")).map_err(io_err)?;
+            t.iter().map_err(io_err)?.map(|item| item.map(|(k, _)| k.value().to_string())).collect::<Result<_, _>>().map_err(io_err)?
+        };
+        let gc_db_lock = gc_db.read().unwrap();
+        let gcdb = gc_db_lock.as_ref().ok_or_else(|| io_err("GC DB not initialized"))?;
+        let gc_read = gcdb.begin_read().map_err(io_err)?;
+        let live_xorbs = gc_read.open_table(GC_LIVE_XORBS_TABLE).map_err(io_err)?;
+        let mut lost = 0usize;
+        for x in &blocks_before {
+            if old_xorbs.contains(x) || missing_xorbs.contains(x) || blocks_after.contains(x) {
+                continue;
+            }
+            let Ok(h) = MerkleHash::from_hex(x) else { continue };
+            let key: [u8; 32] = h.into();
+            if live_xorbs.get(&key).map_err(io_err)?.is_some() {
+                lost += 1;
+                bad_entries.push((x.clone(), "lost_info_block (xorb still in use has no CAS info block in any shard after GC)".to_string()));
+            }
+        }
+        eprintln!("[GC Verify] CAS info blocks: {} xorbs had one in a replaced shard; {lost} in use would be left without one", blocks_before.len());
+    }
+    eprintln!("[GC Verify] New shards: {} file entries checked, {} problems (wrong file layout, CAS info or xorb name)", entries_checked, bad_entries.len());
+    {
+        let mut bad_table = write_txn.open_table(TXN_BAD_FILE_ENTRIES_TABLE).map_err(io_err)?;
+        for (file_hash, reason) in &bad_entries {
+            eprintln!("[GC Verify] Problem in new shards for {file_hash}: {reason}");
+            bad_table.insert(file_hash.as_str(), reason.as_str()).map_err(io_err)?;
+        }
+        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(io_err)?;
+        meta.insert("bad_file_entries", bad_entries.len().to_string().as_str()).map_err(io_err)?;
+    }
+    // Files missing after GC that were not missing before: damage GC itself would cause.
+    let newly_missing: Vec<String> = {
+        let pre = write_txn.open_table(TXN_MISSING_FILES_TABLE).map_err(io_err)?;
+        let post = write_txn.open_table(TXN_MISSING_POST_FILES_TABLE).map_err(io_err)?;
+        let mut out = Vec::new();
+        for item in post.iter().map_err(io_err)? {
+            let (k, _) = item.map_err(io_err)?;
+            if pre.get(k.value()).map_err(io_err)?.is_none() {
+                out.push(k.value().to_string());
+            }
+        }
+        out
+    };
+    for f in newly_missing.iter().take(100) {
+        eprintln!("[GC Verify] File missing after GC that was fine before: {f}");
+    }
+    {
+        let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(io_err)?;
+        meta.insert("newly_missing_files", newly_missing.len().to_string().as_str()).map_err(io_err)?;
+    }
+    eprintln!("[GC Verify] Missing after GC: {missing_post_gc} ({} already missing before GC, {} newly missing)",
+        missing_post_gc.saturating_sub(newly_missing.len()), newly_missing.len());
+    let problems = missing_post_gc + bad_entries.len();
+
+    eprintln!("[GC Verify] Phase 5: Committing verification results (missing files post-gc: {}, bad entries: {})", missing_post_gc, bad_entries.len());
+    if problems == 0 {
         let mut meta = write_txn.open_table(TXN_META_TABLE).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
         meta.insert("status", "verified").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Table err: {e}")))?;
     } else {
@@ -1380,7 +1631,53 @@ pub fn _verify_gc_transaction(
     }).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e))?;
     
     let _ = std::fs::remove_file(txn_path);
-    Ok(missing_post_gc)
+    Ok(problems)
+}
+
+/// Checks every file entry of the registered shards GC leaves in place (not in `old_shards`) for
+/// segments pointing at a xorb in `old_xorbs`. Adds each one to `bad` and returns the number of
+/// shards checked.
+///
+/// Also collects which xorbs have a CAS info block: in the shards being replaced
+/// (`blocks_before`) and in the shards that stay (`blocks_after`).
+fn check_untouched_shards(
+    rt: &Runtime,
+    sfm: &ShardFileManager,
+    old_shards: &HashSet<String>,
+    old_xorbs: &HashSet<String>,
+    bad: &mut Vec<(String, String)>,
+    blocks_before: &mut HashSet<String>,
+    blocks_after: &mut HashSet<String>,
+) -> PyResult<usize> {
+    let shards = rt.block_on(sfm.registered_shard_list())
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to get shard list: {e:?}")))?;
+    let mut checked = 0;
+    for shard_file in shards {
+        let shard_hash = shard_file.shard_hash.hex();
+        let mut reader = shard_file.get_reader().map_err(io_err)?;
+        let replaced = old_shards.contains(&shard_hash);
+        let shard = MDBMinimalShard::from_reader(&mut reader, !replaced, true)
+            .map_err(|e| io_err(format!("Cannot parse shard {shard_hash}: {e:?}")))?;
+        let blocks = if replaced { &mut *blocks_before } else { &mut *blocks_after };
+        for i in 0..shard.num_xorb() {
+            if let Some(view) = shard.xorb(i) {
+                blocks.insert(view.xorb_hash().hex());
+            }
+        }
+        if replaced {
+            continue;
+        }
+        checked += 1;
+        for i in 0..shard.num_files() {
+            let Some(view) = shard.file(i) else { continue };
+            let info = MDBFileInfo::from(view);
+            if let Some(seg) = info.segments.iter().find(|s| old_xorbs.contains(&s.xorb_hash.hex())) {
+                bad.push((info.metadata.file_hash.hex(), format!(
+                    "points_at_xorb_to_be_deleted ({}) in untouched shard {shard_hash}", seg.xorb_hash.hex())));
+            }
+        }
+    }
+    Ok(checked)
 }
 
 /// Commits a staged transaction: moves the old xorbs that are still unused to bin/xorbs/.
@@ -1476,7 +1773,7 @@ pub fn _commit_gc_transaction(
         }
 
         eprintln!("[GC Commit] Moving {} old XORBs to bin...", to_move.len());
-        rt.block_on(for_each_concurrent(to_move.clone(), |hash_str| {
+        rt.block_on(for_each_concurrent(&to_move, |hash_str| {
             let (client, bucket) = (&client, &bucket);
             async move {
                 s3_move_object(client, bucket, &format!("xorbs/default/{hash_str}"), &format!("bin/xorbs/{hash_str}")).await
@@ -1696,7 +1993,7 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
         if let Ok(Some(timestamp)) = meta_table.get("timestamp") {
             dict.set_item("timestamp", timestamp.value())?;
         }
-        for key in ["started_at", "staged_at", "committed_at", "reverted_at"] {
+        for key in ["started_at", "staged_at", "committed_at", "reverted_at", "bad_file_entries", "newly_missing_files"] {
             if let Ok(Some(v)) = meta_table.get(key) {
                 dict.set_item(key, v.value())?;
             }
@@ -1776,3 +2073,105 @@ pub fn _get_gc_transaction_info(py: Python<'_>) -> PyResult<Py<pyo3::types::PyDi
     Ok(dict.into())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(xorb: u8, idx: u32) -> [u8; 36] {
+        let mut k = [0u8; 36];
+        k[0..32].copy_from_slice(&[xorb; 32]);
+        k[32..36].copy_from_slice(&idx.to_le_bytes());
+        k
+    }
+
+    /// Builds a chunk position map from (old xorb, old idx, new xorb, new idx) rows and runs
+    /// `remap_segment` for chunks `start..end` of old xorb `old`.
+    fn remap(rows: &[(u8, u32, u8, u32)], old: u8, start: u32, end: u32) -> Option<([u8; 32], u32)> {
+        let db = redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(TXN_CHUNK_MAP_TABLE).unwrap();
+            for &(ox, oi, nx, ni) in rows {
+                table.insert(&pos(ox, oi), &pos(nx, ni)).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(TXN_CHUNK_MAP_TABLE).unwrap();
+        remap_segment(&table, &[old; 32], start, end).map(|(h, s)| (<[u8; 32]>::from(h), s))
+    }
+
+    #[test]
+    fn remaps_a_segment_that_moved_in_one_piece() {
+        // Old xorb 1, chunks 3..6 moved to new xorb 9 at positions 10..13.
+        let rows = [(1, 3, 9, 10), (1, 4, 9, 11), (1, 5, 9, 12)];
+        assert_eq!(remap(&rows, 1, 3, 6), Some(([9; 32], 10)));
+    }
+
+    #[test]
+    fn refuses_a_segment_split_across_new_xorbs() {
+        // Chunk 5 landed at the start of the next new xorb.
+        let rows = [(1, 3, 9, 10), (1, 4, 9, 11), (1, 5, 8, 0)];
+        assert_eq!(remap(&rows, 1, 3, 6), None);
+    }
+
+    #[test]
+    fn refuses_a_segment_whose_chunks_are_not_consecutive() {
+        let rows = [(1, 3, 9, 10), (1, 4, 9, 11), (1, 5, 9, 20)];
+        assert_eq!(remap(&rows, 1, 3, 6), None);
+    }
+
+    #[test]
+    fn copied_cas_info_gets_unpacked_positions() {
+        use mdb_shard::metadata_shard::xorb_structs::{MDBXorbInfo, XorbChunkSequenceEntry, XorbChunkSequenceHeader};
+        // A block as an earlier GC wrote it: positions are packed (compressed) byte offsets.
+        let h = |b: u8| MerkleHash::from([b; 32]);
+        let info = MDBXorbInfo {
+            metadata: XorbChunkSequenceHeader::new(h(9), 3, 130),
+            chunks: vec![
+                XorbChunkSequenceEntry::new(h(1), 100u32, 0u32),
+                XorbChunkSequenceEntry::new(h(2), 200u32, 50u32),
+                XorbChunkSequenceEntry::new(h(3), 300u32, 90u32),
+            ],
+        };
+        let fixed = with_unpacked_positions(info);
+        let starts: Vec<u32> = fixed.chunks.iter().map(|c| c.chunk_byte_range_start).collect();
+        assert_eq!(starts, vec![0, 100, 300]);
+        assert_eq!(fixed.metadata.num_bytes_in_xorb, 600);
+        // Hashes, sizes and the xorb hash are untouched.
+        assert_eq!(fixed.metadata.xorb_hash, h(9));
+        assert_eq!(fixed.chunks[2].chunk_hash, h(3));
+        assert_eq!(fixed.chunks[2].unpacked_segment_bytes, 300);
+        // Already-correct blocks (from uploads) stay the same.
+        assert_eq!(with_unpacked_positions(fixed.clone()), fixed);
+    }
+
+    #[test]
+    fn new_xorb_is_named_by_its_footer_hash() {
+        use mdb_shard::xorb_object::{serialize_chunk, CompressionScheme, XorbObject};
+        let mut raw = Vec::new();
+        serialize_chunk(&[7u8; 5000], &mut raw, CompressionScheme::LZ4).unwrap();
+        serialize_chunk(&(0..6000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>(), &mut raw, CompressionScheme::LZ4).unwrap();
+        let mut full = Vec::new();
+        let (_, name) = reconstruct_xorb_with_footer(&mut full, &raw).unwrap();
+        let footer = XorbObject::deserialize(&mut std::io::Cursor::new(&full)).unwrap().info.xorb_hash;
+        assert_eq!(name, footer);
+        assert!(XorbObject::validate_xorb_object(&mut std::io::Cursor::new(&full), &name).unwrap().is_some());
+    }
+
+    #[test]
+    fn refuses_a_segment_with_a_chunk_that_was_not_repacked() {
+        let rows = [(1, 3, 9, 10), (1, 5, 9, 12)];
+        assert_eq!(remap(&rows, 1, 3, 6), None);
+    }
+
+    #[test]
+    fn uses_positions_of_the_right_old_xorb() {
+        // The same chunks were repacked from two old xorbs to different places; each old xorb's
+        // segment must map to its own copy.
+        let rows = [(1, 0, 9, 0), (1, 1, 9, 1), (2, 0, 9, 50), (2, 1, 9, 51)];
+        assert_eq!(remap(&rows, 1, 0, 2), Some(([9; 32], 0)));
+        assert_eq!(remap(&rows, 2, 0, 2), Some(([9; 32], 50)));
+    }
+}
