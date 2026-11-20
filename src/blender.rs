@@ -1813,9 +1813,18 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
         match status_val.as_str() {
             "staged" | "committed" => {},
             "consolidated" | "verified" | "verification_failed" | "failed" => {
-                return Err(value_err("Cannot revert: transaction has not been staged yet. Nothing to revert."));
+                // Not staged: start only wrote under gc_consolidated/; shards/ and xorbs/default/
+                // are untouched. Discarding the run means deleting those files.
+                let removed = rt.block_on(delete_prefix(&client, &bucket, "gc_consolidated/")).map_err(io_err)?;
+                eprintln!("[GC Revert] Run was not staged (status '{status_val}'): deleted {removed} objects under gc_consolidated/; nothing else changed.");
+                meta.insert("status", "reverted").map_err(io_err)?;
+                meta.insert("reverted_at", unix_now().to_string().as_str()).map_err(io_err)?;
+                drop(meta);
+                write_txn.commit().map_err(io_err)?;
+                drop(db);
+                return upload_lock(&rt, &client, &bucket, txn_path);
             },
-            other => return Err(value_err(format!("Cannot revert: status is '{other}', must be 'staged' or 'committed'"))),
+            other => return Err(value_err(format!("Cannot revert: status is '{other}', must be one of consolidated, verified, failed, staged or committed"))),
         }
 
         let old_shards_table = write_txn.open_table(TXN_OLD_SHARDS_TABLE).map_err(io_err)?;
@@ -1857,6 +1866,24 @@ pub fn _revert_gc_transaction() -> PyResult<()> {
     write_txn.commit().map_err(io_err)?;
     drop(db);
     upload_lock(&rt, &client, &bucket, txn_path)
+}
+
+/// Deletes every object under `prefix`; returns how many. Stops at the first error.
+async fn delete_prefix(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Result<usize, String> {
+    let mut keys = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let resp = s3_list_objects_v2(client, bucket, prefix, token.as_deref(), MAX_S3_ATTEMPTS).await?;
+        keys.extend(resp.contents().iter().filter_map(|o| o.key().map(String::from)));
+        token = resp.next_continuation_token().map(String::from);
+        if token.is_none() {
+            break;
+        }
+    }
+    for key in &keys {
+        s3_delete_object(client, bucket, key, MAX_S3_ATTEMPTS).await?;
+    }
+    Ok(keys.len())
 }
 
 /// Reads the lock file's status and committed_at, if a lock exists.
