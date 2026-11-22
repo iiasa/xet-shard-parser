@@ -305,8 +305,27 @@ pub struct DeepAuditReport {
     pub blocks_wrong_chunks: Vec<(String, String)>,
     /// Blocks right in chunks and sizes but with positions written the old GC way. Harmless.
     pub blocks_old_positions: usize,
-    /// Blocks for xorbs that are not in S3.
-    pub blocks_xorb_missing: usize,
+    /// (xorb hash hex, shard hash hex): blocks for xorbs that are not in S3. Shard upload
+    /// verification trusts these blocks, so an upload from a stale client cache that reuses such
+    /// a xorb is accepted. GC drops a block once no file in use needs its xorb (the xorb is then
+    /// unused, so its shard is rewritten); a block still listed after a staged run belongs to a
+    /// xorb that a file in use still points at.
+    pub blocks_xorb_missing: Vec<(String, String)>,
+    /// (xorb hash hex, shard hash hex): blocks for xorbs that are in S3 but whose footer can't be
+    /// read (for example stored without one). The xorb is there: repair its footer, don't drop.
+    pub blocks_footer_unreadable: Vec<(String, String)>,
+}
+
+/// Reason for a file entry whose xorb is in S3 but has no readable footer. The entry may well be
+/// right; the xorb's footer needs repairing (`index_xorb`), so the entry must not be dropped.
+pub const XORB_FOOTER_UNREADABLE: &str = "xorb_footer_unreadable";
+
+/// What the deep audit found in S3 for one xorb.
+#[derive(Clone)]
+enum XorbFooter {
+    Found(ChunkList),
+    Missing,
+    Unreadable,
 }
 
 /// Read-only check of every registered shard against the xorb footers in S3:
@@ -322,7 +341,7 @@ pub async fn deep_audit_shards(
 ) -> Result<DeepAuditReport, String> {
     use futures::stream::{iter, StreamExt};
     let mut report = DeepAuditReport::default();
-    let mut chunk_lists: HashMap<MerkleHash, Option<ChunkList>> = HashMap::new();
+    let mut chunk_lists: HashMap<MerkleHash, XorbFooter> = HashMap::new();
 
     for (n, (shard_hash, path)) in shards.iter().enumerate() {
         let bytes = std::fs::read(path).map_err(|e| format!("Cannot read shard {shard_hash}: {e}"))?;
@@ -354,7 +373,10 @@ pub async fn deep_audit_shards(
         let fetched = iter(wanted.into_iter().map(|h| async move {
             let key = format!("xorbs/default/{}", h.hex());
             let res = s3_download_range(client, bucket, &key, "bytes=-1048576", MAX_S3_ATTEMPTS, false).await
-                .map(|footer| footer.and_then(|f| chunk_list_from_xorb_footer(&f)));
+                .map(|footer| match footer {
+                    None => XorbFooter::Missing,
+                    Some(f) => chunk_list_from_xorb_footer(&f).map_or(XorbFooter::Unreadable, XorbFooter::Found),
+                });
             (h, res)
         }))
         .buffer_unordered(MAX_CONCURRENCY)
@@ -364,14 +386,23 @@ pub async fn deep_audit_shards(
             chunk_lists.insert(h, res?);
         }
         let known: HashMap<MerkleHash, ChunkList> = chunk_lists.iter()
-            .filter_map(|(h, l)| l.as_ref().map(|l| (*h, l.clone())))
+            .filter_map(|(h, f)| match f {
+                XorbFooter::Found(l) => Some((*h, l.clone())),
+                _ => None,
+            })
             .collect();
 
         for info in &cas_infos {
             report.blocks_checked += 1;
             let h = info.metadata.xorb_hash;
             match known.get(&h) {
-                None => report.blocks_xorb_missing += 1,
+                None => {
+                    let entry = (h.hex(), shard_hash.clone());
+                    match chunk_lists.get(&h) {
+                        Some(XorbFooter::Unreadable) => report.blocks_footer_unreadable.push(entry),
+                        _ => report.blocks_xorb_missing.push(entry),
+                    }
+                },
                 Some(list) => {
                     let same_chunks = info.chunks.len() == list.len()
                         && info.chunks.iter().zip(list.iter()).all(|(c, (lh, ls))| c.chunk_hash == *lh && c.unpacked_segment_bytes == *ls);
@@ -386,6 +417,10 @@ pub async fn deep_audit_shards(
         for file in &files {
             report.entries_checked += 1;
             if let Err((reason, detail)) = check_file_layout(file, &known) {
+                // check_file_layout can't tell a missing xorb from one without a readable footer.
+                let unreadable = reason == XORB_NOT_FOUND
+                    && MerkleHash::from_hex(&detail).is_ok_and(|h| matches!(chunk_lists.get(&h), Some(XorbFooter::Unreadable)));
+                let reason = if unreadable { XORB_FOOTER_UNREADABLE } else { reason.as_str() };
                 report.bad_entries.push((file.metadata.file_hash.hex(), format!("{reason} ({detail})"), shard_hash.clone()));
             }
         }

@@ -1179,7 +1179,8 @@ impl ShardIndex {
         dict.set_item("blocks_checked", report.blocks_checked)?;
         dict.set_item("blocks_wrong_chunks", report.blocks_wrong_chunks)?;
         dict.set_item("blocks_old_positions", report.blocks_old_positions)?;
-        dict.set_item("blocks_xorb_missing", report.blocks_xorb_missing)?;
+        dict.set_item("blocks_xorb_missing", report.blocks_xorb_missing)?;  // (xorb hash, shard hash)
+        dict.set_item("blocks_footer_unreadable", report.blocks_footer_unreadable)?;  // (xorb hash, shard hash)
         Ok(dict.into())
     }
 
