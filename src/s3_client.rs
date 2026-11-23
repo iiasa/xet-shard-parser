@@ -340,18 +340,44 @@ pub async fn s3_head_etag_size(client: &Client, bucket: &str, key: &str, max_att
     }
 }
 
+/// Size of each range read when comparing a copy with its source byte by byte.
+const COPY_COMPARE_PART: i64 = 4 * 1024 * 1024;
+
+/// True if the two objects (both `size` bytes) hold the same bytes. Reads them in
+/// COPY_COMPARE_PART ranges, so memory stays small however large they are.
+async fn s3_same_content(client: &Client, bucket: &str, a: &str, b: &str, size: i64, max_attempts: u32) -> Result<bool, String> {
+    let mut start = 0i64;
+    while start < size {
+        let end = (start + COPY_COMPARE_PART).min(size) - 1;
+        let range = format!("bytes={start}-{end}");
+        let x = s3_download_range(client, bucket, a, &range, max_attempts, true).await?.unwrap_or_default();
+        let y = s3_download_range(client, bucket, b, &range, max_attempts, true).await?.unwrap_or_default();
+        if x.len() as i64 != end - start + 1 || x != y {
+            return Ok(false);
+        }
+        start = end + 1;
+    }
+    Ok(true)
+}
+
 /// Copies `src_key` to `dest_key` in the same bucket, then checks the copy against the source:
-/// same size, and the same ETag (the MD5 of the content) when the source was a single-part
-/// upload. Multipart ETags are not content MD5s, so for those only the size is compared.
+/// same size, and the same bytes. Matching single-part ETags settle it without reading the
+/// objects. Otherwise both are read and compared: multipart ETags are not content MD5s, and
+/// some S3 stores (for example with encryption at rest) give a copy a different ETag even
+/// though its bytes are identical.
 pub async fn s3_copy_object_verified(client: &Client, bucket: &str, src_key: &str, dest_key: &str, max_attempts: u32) -> Result<(), String> {
     s3_copy_object(client, bucket, &format!("{bucket}/{src_key}"), dest_key, max_attempts, false).await?;
     let src = s3_head_etag_size(client, bucket, src_key, max_attempts).await?
         .ok_or_else(|| format!("Copy source {src_key} disappeared"))?;
     let dest = s3_head_etag_size(client, bucket, dest_key, max_attempts).await?
         .ok_or_else(|| format!("Copy of {src_key} is missing at {dest_key}"))?;
-    let etag_comparable = !src.0.is_empty() && !src.0.contains('-');
-    if src.1 != dest.1 || (etag_comparable && src.0 != dest.0) {
-        return Err(format!("Copy of {src_key} to {dest_key} differs: source (etag {}, {} bytes), copy (etag {}, {} bytes)", src.0, src.1, dest.0, dest.1));
+    let differs = || format!("Copy of {src_key} to {dest_key} differs: source (etag {}, {} bytes), copy (etag {}, {} bytes)", src.0, src.1, dest.0, dest.1);
+    if src.1 != dest.1 {
+        return Err(differs());
+    }
+    let etag_settles = !src.0.is_empty() && !src.0.contains('-') && src.0 == dest.0;
+    if !etag_settles && !s3_same_content(client, bucket, src_key, dest_key, src.1, max_attempts).await? {
+        return Err(differs());
     }
     Ok(())
 }
